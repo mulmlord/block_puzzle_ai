@@ -147,6 +147,12 @@ class BatchGame:
         self.lines_cleared += cand.lines[b, slot, pos]
         return points
 
+    def keep(self, idx: torch.Tensor) -> None:
+        """Drop every game not in ``idx`` (used by evaluation to stop simulating finished games)."""
+        for name in ("board", "pending", "score", "moves", "lines_cleared", "history"):
+            setattr(self, name, getattr(self, name)[idx])
+        self.n = len(self.board)
+
     # ---- interop with the reference simulator ----------------------------------------------
     @classmethod
     def from_game(cls, game: Game, device: str | torch.device = "cpu") -> BatchGame:
