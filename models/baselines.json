@@ -1,0 +1,27 @@
+{
+ "eval_seed": 2024,
+ "games": 128,
+ "max_moves": 20000,
+ "random": {
+  "games": 128,
+  "mean": 1012.109375,
+  "median": 900.0,
+  "min": 530,
+  "max": 2050,
+  "stdev": 370.5309795241275,
+  "mean_moves": 23.90625,
+  "points_per_move": 42.33660130718954,
+  "truncated": 0
+ },
+ "heuristic": {
+  "games": 128,
+  "mean": 20878.671875,
+  "median": 15515.0,
+  "min": 3170,
+  "max": 87560,
+  "stdev": 16314.063065491502,
+  "mean_moves": 279.3984375,
+  "points_per_move": 74.72723205547634,
+  "truncated": 0
+ }
+}
