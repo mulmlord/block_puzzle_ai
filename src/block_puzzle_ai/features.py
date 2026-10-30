@@ -33,16 +33,17 @@ def n_globals(t: Tables) -> int:
     return 3 * t.n_pieces + 5
 
 
-def fit_maps(t: Tables, boards: torch.Tensor) -> torch.Tensor:
-    """(K, 100) bool boards -> (K, P, 100) bool: piece p fits with top-left at pos."""
+def fit_maps(t: Tables, boards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """(K, 100) bool boards -> fits (K, P, 100) bool (piece p fits with top-left at pos), counts (K, P)."""
     dtype = torch.float16 if boards.is_cuda else torch.float32
     masks = t.mask.flatten(0, 1).to(dtype).T  # (cell, P * pos)
     valid = t.valid.flatten()
-    out = []
+    fits, counts = [], []
     for chunk in boards.split(FIT_CHUNK):
-        overlap = chunk.to(dtype) @ masks
-        out.append((overlap == 0) & valid)
-    return torch.cat(out).view(len(boards), t.n_pieces, CELLS)
+        fit = ((chunk.to(dtype) @ masks) == 0) & valid
+        fits.append(fit)
+        counts.append(fit.view(len(chunk), t.n_pieces, CELLS).to(dtype).sum(-1))  # bool.sum() would upcast to int64
+    return torch.cat(fits).view(len(boards), t.n_pieces, CELLS), torch.cat(counts).float()
 
 
 def isolated_empty(boards: torch.Tensor) -> torch.Tensor:
@@ -61,9 +62,9 @@ def encode(env: BatchGame, cand: Candidates, index: torch.Tensor | None = None) 
     board = cand.after[b, slot, pos]
     remaining = env.pending[b].gather(1, t.remaining[slot])  # (K, 2)
 
-    fits = fit_maps(t, board)
-    fit_any = fits.any(-1)
-    fit_frac = fits.sum(-1) / t.valid.sum(-1)
+    fits, fit_count = fit_maps(t, board)
+    fit_any = fit_count > 0
+    fit_frac = fit_count / t.valid.sum(-1)
     k = torch.arange(len(index), device=board.device)
     remaining_maps = fits[k[:, None], remaining]  # (K, 2, 100)
     planes = torch.cat([board[:, None], remaining_maps], 1).view(-1, 3, N, N)

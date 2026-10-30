@@ -71,8 +71,7 @@ class ValueAgent:
     @torch.no_grad()
     def q_values(self, env: BatchGame, cand: Candidates) -> tuple[Afterstates, torch.Tensor, torch.Tensor]:
         a = encode(env, cand)
-        with torch.autocast(env.device.type, dtype=torch.bfloat16, enabled=env.device.type == "cuda"):
-            v = self.net(a.planes, a.globals).float()
+        v = self.net.predict(a.planes, a.globals)
         return a, a.points * self.reward_scale + self.gamma * v, v
 
     def act(self, env: BatchGame, cand: Candidates) -> tuple[torch.Tensor, torch.Tensor]:
