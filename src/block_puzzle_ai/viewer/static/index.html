@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Block Puzzle AI</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <h1>Block Puzzle <span>AI</span></h1>
+    <p class="subtitle">Watch a reinforcement-learning agent play the reverse-engineered game, move by move.</p>
+    <span id="conn" class="conn" title="connection">●</span>
+  </header>
+
+  <main class="layout">
+    <section class="stage">
+      <div class="scorebar">
+        <div class="stat big"><label>Score</label><output id="score">0</output></div>
+        <div class="stat"><label>Best (session)</label><output id="best">0</output></div>
+        <div class="stat"><label>Moves</label><output id="moves">0</output></div>
+        <div class="stat"><label>Lines</label><output id="lines">0</output></div>
+      </div>
+      <div class="canvas-wrap">
+        <canvas id="board" aria-label="game board"></canvas>
+        <div id="toast" class="toast" aria-live="polite"></div>
+        <div id="overlay" class="overlay hidden"><div><strong>Game over</strong><span id="overlay-score"></span></div></div>
+      </div>
+    </section>
+
+    <aside class="panel">
+      <div class="card">
+        <h2>Controls</h2>
+        <label class="field">Agent
+          <select id="agent"></select>
+        </label>
+        <label class="field">Seed
+          <span class="row">
+            <input id="seed" type="number" min="0" placeholder="random">
+            <button id="dice" class="ghost" title="random seed">🎲</button>
+          </span>
+        </label>
+        <div class="buttons">
+          <button id="new">New game</button>
+          <button id="play" class="primary">▶ Play</button>
+          <button id="step" class="ghost">Step</button>
+        </div>
+        <label class="field">Speed <output id="speed-label">4 moves/s</output>
+          <input id="speed" type="range" min="1" max="61" value="4">
+        </label>
+        <label class="check"><input id="auto" type="checkbox" checked> Start a new game automatically</label>
+      </div>
+
+      <div class="card">
+        <h2>Agent's view of the last move</h2>
+        <dl class="insight">
+          <dt>Legal moves considered</dt><dd id="legal">–</dd>
+          <dt>Points for the move</dt><dd id="points">–</dd>
+          <dt>Expected points from here<small>reward + discounted future, RL only</small></dt><dd id="expected">–</dd>
+        </dl>
+      </div>
+
+      <div class="card">
+        <h2>Games this session</h2>
+        <p class="summary" id="session-summary">No finished games yet.</p>
+        <ol id="history" class="barlist"></ol>
+      </div>
+
+      <div class="card">
+        <h2 id="chart-title">Training progress</h2>
+        <p class="caption">Mean score over 128 fixed-seed evaluation games, by training time.</p>
+        <label class="field compact">Run <select id="run"></select></label>
+        <div id="chart" class="chart"></div>
+        <details>
+          <summary>Show as table</summary>
+          <table id="chart-table"></table>
+        </details>
+      </div>
+    </aside>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>
