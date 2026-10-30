@@ -2,7 +2,7 @@
 
 A reinforcement-learning agent for the Android game **Block Puzzle** (`game.puzzle.blockpuzzle` v6.1).
 The game rules were reverse-engineered from the shipped APK, re-implemented as a fast simulator,
-and used to train an agent that scores about **70× more than a hand-tuned heuristic**.
+and used to train an agent that scores about **70× more than a hand-tuned heuristic**. Its best game scored **11.75 million** points.
 A browser app lets you watch it play live.
 
 ![viewer](docs/media/viewer.gif)
@@ -18,7 +18,7 @@ All agents were evaluated on the same 128 fixed seeds, with games capped at 20,0
 | **RL `models/rl_v1.pt`** | **1,493,256** | **1,854,600** | **2,206,540** | 13,782 | **108** |
 
 - **Cap:** 54 of the 128 RL games were still alive at the 20,000-move cap. The table therefore *understates* the agent.
-- **Long run:** a 64-game run with a 200,000-move cap is in [`docs/RESULTS.md`](docs/RESULTS.md).
+- **Long run:** with the cap raised to 200,000 moves, all 64 games ended in a real game over. Mean **2.6M**, median 1.8M. **High score: 11,750,010 points in 108,511 moves.** See [`docs/RESULTS.md`](docs/RESULTS.md).
 - **Scoring efficiency:** the agent scores more points per move than the heuristic because it deliberately sets up multi-line clears. The game pays `50·L·(L+1)` for `L` simultaneous lines.
 
 ## How it works
