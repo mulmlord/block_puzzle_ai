@@ -1,0 +1,19 @@
+# Third-party binaries: never commit the original APKs or anything extracted from them
+*.apk
+*.so
+extracted/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# Training artifacts
+runs/
+checkpoints/
+*.pt
+!models/*.pt
+wandb/
+
+.claude/

@@ -1,0 +1,25 @@
+[project]
+name = "block-puzzle-ai"
+version = "0.1.0"
+description = "Reverse-engineered block puzzle simulator and RL agent that learns to maximize the high score"
+authors = [
+    { name = "Mudcrawler", email = "kenny.loeffler@outlook.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.162.0",
+    "numpy>=2.5.4",
+    "pyelftools>=0.33",
+    "torch>=2.15.0",
+    "unicorn>=2.1.4",
+    "uvicorn[standard]>=0.54.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.13,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]
