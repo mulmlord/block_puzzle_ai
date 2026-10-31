@@ -1,18 +1,32 @@
-"""Time each phase of one training step (512 envs) with the trained net."""
+"""Time each phase of one training step (512 envs) with the trained net.
+
+``--eager`` times the pre-#9 path: eager inference in 16k-row chunks and an uncompiled, unfused update.
+"""
+import sys
 import time
 from collections import defaultdict
 
 import torch
-import torch.nn.functional as F
 
 from block_puzzle_ai.batch_env import BatchGame
 from block_puzzle_ai.features import encode
 from block_puzzle_ai.model import load_checkpoint
-from block_puzzle_ai.train import Config, choose, StateEval
+from block_puzzle_ai.train import Config, Learner, StateEval, choose
 
+EAGER = "--eager" in sys.argv
 dev = torch.device("cuda")
 cfg = Config()
 net, _ = load_checkpoint("models/rl_v1.pt", dev)
+if EAGER:
+
+    def eager_predict(planes, globals_):  # ValueNet.predict before #9
+        out = []
+        for p, g in zip(planes.split(16384), globals_.split(16384)):
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                out.append(net(p, g).float())
+        return torch.cat(out)
+
+    net.predict = eager_predict
 env = BatchGame(cfg.envs, dev, seed=0)
 rng = torch.Generator(dev).manual_seed(1)
 T = defaultdict(float)
@@ -57,37 +71,29 @@ with torch.no_grad():
 torch.cuda.synchronize()
 wall = time.perf_counter() - t0
 
-# update phase: 2 epochs over rollout 16 x 512 samples, minibatch 2048
+# update phase: the real Learner on one rollout of random data (cfg.rollout x cfg.envs samples)
 net.train()
-opt = torch.optim.AdamW(net.parameters(), lr=1e-9)
-x = torch.rand(16 * 512, 3, 10, 10, device=dev).round()
-g = torch.rand(16 * 512, net_g := net.head[0].in_features - net.trunk_out if hasattr(net, "trunk_out") else 0, device=dev) if False else None
+learner = Learner(net, Config(lr=1e-9), rng)
+if EAGER:
+    learner.forward = net
+    learner.opt = torch.optim.AdamW(net.parameters(), lr=1e-9, weight_decay=1e-5)
+a_g = encode(env, env.candidates()).globals.shape[1]
+planes = torch.rand(cfg.rollout * cfg.envs, 3, 10, 10, device=dev) < 0.4
+globals_ = torch.rand(cfg.rollout * cfg.envs, a_g, device=dev)
+target = torch.rand(cfg.rollout * cfg.envs, device=dev)
 
 
 def update():
-    planes = torch.rand(16 * 512, 3, 10, 10, device=dev).round()
-    globals_ = torch.rand(16 * 512, a_g, device=dev)
-    target = torch.rand(16 * 512, device=dev)
-    for _ in range(cfg.epochs):
-        for idx in torch.randperm(len(target), device=dev).split(cfg.minibatch):
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                pred = net(planes[idx], globals_[idx]).float()
-            loss = F.mse_loss(pred, target[idx])
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
-            opt.step()
-            loss.item()
+    learner.update(planes, globals_, target)
 
 
-a_g = encode(env, env.candidates()).globals.shape[1]
 update()
 n_upd = 4
 for _ in range(n_upd):
     timed("update(per 16 steps)", update)
 
 per_step = {k: v / steps for k, v in T.items() if k != "update(per 16 steps)"}
-per_step["update"] = T["update(per 16 steps)"] / n_upd / 16
+per_step["update"] = T["update(per 16 steps)"] / n_upd / cfg.rollout
 total = sum(per_step.values())
 print(f"after-states per step: {K / steps:,.0f} (avg {K / steps / env.n:.0f} per env)")
 for k, v in sorted(per_step.items(), key=lambda kv: -kv[1]):

@@ -111,3 +111,39 @@ Score quantiles with search:
 | p10 | p25 | p50 | p75 | p90 |
 |---:|---:|---:|---:|---:|
 | 976k | 1.69M | 4.20M | 9.07M | 13.2M |
+
+## Training speed (ticket #9)
+
+`scripts/profile_step.py` measures one training step: 512 envs, mid-game states of `rl_v1`, with a sync between phases. Run with `--eager` for the old code path.
+
+| Phase (ms per step) | Before | After |
+|---|---:|---:|
+| Net inference (≈38k after-states) | 62.2 | 25.7 |
+| `encode` | 9.2 | 5.7 |
+| Network update (amortized) | 10.1 | 4.5 |
+| `step` + `candidates` | 5.4 | 5.1 |
+| **Total** | **86.9 (5.9k moves/s)** | **41.1 (12.5k moves/s): 2.1×** |
+
+What changed:
+- **Inference** (`ValueNet.predict`): the net now runs in fixed 2,048-row chunks, replayed as one CUDA graph (`torch.compile(mode="reduce-overhead")`). Neither part pays off alone. At 2,048 rows a layer's activations (13 MB) stay in the 32 MB L2 cache, and the graph removes the kernel launches that dominate passes this small. Eager inference at 2,048 rows is no faster than at 16k rows (64 vs 62 ms).
+- **`fit_maps`**: the compare/mask/count epilogue after the matmul is compiled into a single pass.
+- **Update** (`Learner`): fused AdamW, forward + backward as a CUDA graph, and one host sync per update instead of one per minibatch.
+
+Tried and dropped:
+- **Pruning candidates with the heuristic:** its top 16 moves contain the net's best move only 55% of the time (77% for the top 32).
+- **Deduplicating after-states:** only 4.3% are exact duplicates.
+- **Wider nets:** 48 and 64 channels cost 1.7× and 2.2× per evaluation, so they are a strength question for #8 rather than a speed-up.
+
+60-minute run from scratch (`runs/speed9`, same config as `runs/main`):
+
+| | Moves / s (median) | Best eval in the first hour | Eval at ~31M moves |
+|---|---:|---:|---:|
+| `runs/main` (old code) | 6.5k | 1,031,638 (25 min) | 1,263,239 (102 min) |
+| `runs/speed9` | 12.9k | 1,224,598 (58 min) | 1,224,598 (58 min) |
+
+Learning per move is unchanged. Each wall-clock hour now covers about twice as many moves.
+
+The CUDA-graphed kernels round bf16 outputs a little differently, which flips some near-tie moves, so individual games diverge. Playing strength is unchanged within noise. Death rate of `rl_v1`, graphed vs eager:
+- seed 2024 (128 games): 1.23 [0.90, 1.69]
+- seed 2025 (256 games): 0.95 [0.76, 1.20]
+- pooled: **1.04 [0.87, 1.25]**

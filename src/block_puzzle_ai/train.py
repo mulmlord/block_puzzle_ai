@@ -112,6 +112,34 @@ def lambda_returns(r, best, terminal, cut, explored, cfg: Config) -> torch.Tenso
     return g
 
 
+class Learner:
+    """Regresses the net on a rollout's targets: ``cfg.epochs`` passes over shuffled minibatches."""
+
+    def __init__(self, net: ValueNet, cfg: Config, rng: torch.Generator):
+        self.net, self.cfg, self.rng = net, cfg, rng
+        cuda = next(net.parameters()).is_cuda
+        self.opt = torch.optim.AdamW(net.parameters(), lr=cfg.lr, weight_decay=1e-5, fused=cuda)
+        # CUDA graphs over forward + backward: each minibatch is launch-bound, and they all have one size
+        self.forward = torch.compile(net, mode="reduce-overhead", dynamic=False) if cuda else net
+
+    def update(self, planes: torch.Tensor, globals_: torch.Tensor, target: torch.Tensor) -> float:
+        """One update on (planes, globals_) -> target; returns the mean minibatch loss with a single host sync."""
+        cuda = target.is_cuda
+        losses = []
+        for _ in range(self.cfg.epochs):
+            perm = torch.randperm(len(target), device=target.device, generator=self.rng)
+            for idx in perm.split(self.cfg.minibatch):
+                with torch.autocast("cuda", dtype=torch.bfloat16, enabled=cuda):
+                    pred = self.forward(planes[idx].float(), globals_[idx]).float()
+                loss = F.mse_loss(pred, target[idx])
+                self.opt.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.net.parameters(), 1.0)
+                self.opt.step()
+                losses.append(loss.detach())
+        return float(torch.stack(losses).mean())
+
+
 def train(cfg: Config, out: Path) -> None:
     out.mkdir(parents=True, exist_ok=True)
     (out / "config.json").write_text(json.dumps(asdict(cfg), indent=2))
@@ -122,8 +150,8 @@ def train(cfg: Config, out: Path) -> None:
         net, _ = load_checkpoint(cfg.init, device)
     else:
         net = ValueNet(n_globals(env.t), cfg.channels, cfg.blocks, cfg.hidden).to(device, memory_format=torch.channels_last)
-    opt = torch.optim.AdamW(net.parameters(), lr=cfg.lr, weight_decay=1e-5)
     rng = torch.Generator(device).manual_seed(cfg.seed + 1)
+    learner = Learner(net, cfg, rng)
 
     metrics_file = (out / "metrics.jsonl").open("a")
     recent = deque(maxlen=500)
@@ -202,20 +230,7 @@ def train(cfg: Config, out: Path) -> None:
         log_moves += t_steps * n
 
         target = lambda_returns(r, best, terminal, cut, explored, cfg).flatten()
-        x_planes = planes.flatten(0, 1)
-        x_globals = globals_.flatten(0, 1)
-        losses = []
-        for _ in range(cfg.epochs):
-            perm = torch.randperm(len(target), device=device, generator=rng)
-            for idx in perm.split(cfg.minibatch):
-                with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
-                    pred = net(x_planes[idx].float(), x_globals[idx]).float()
-                loss = F.mse_loss(pred, target[idx])
-                opt.zero_grad(set_to_none=True)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
-                opt.step()
-                losses.append(loss.item())
+        loss = learner.update(planes.flatten(0, 1), globals_.flatten(0, 1), target)
 
         now = time.perf_counter()
         if now - last_log > 30 and recent:
@@ -226,7 +241,7 @@ def train(cfg: Config, out: Path) -> None:
                     "moves_per_s": round(log_moves / (now - last_log)),
                     "episodes": episodes,
                     "eps": eps,
-                    "loss": statistics.fmean(losses),
+                    "loss": loss,
                     "recent_mean": statistics.fmean(scores),
                     "recent_median": statistics.median(scores),
                     "recent_moves": statistics.fmean(m for _, m in recent),
