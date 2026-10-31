@@ -60,3 +60,54 @@ Score quantiles:
 | p10 | p25 | p50 | p75 | p90 |
 |---:|---:|---:|---:|---:|
 | 526k | 915k | 1.78M | 3.57M | 5.11M |
+
+## Lookahead search (ticket #10)
+
+`LookaheadAgent` searches one move deeper, but only where the agent senses danger. That is when the best 1-ply Q of a state is below `search_below`. There it re-scores the `top_k` best moves as `r + γ·E[best 1-ply Q after the next spawn]`. The expectation runs over every piece the game can spawn next, with the exact probabilities from `randTiles`. If no move is left, the value is 0. The network is unchanged, and there is no retraining.
+
+Choosing the gate (rl_v1, 256 games, seed `4242`):
+- The best Q has a median of 115 and a 2nd percentile of 109.9.
+- Q < 100 occurs on only 0.08% of moves, but on 97% of the last moves before a game over. 2 and 3 moves before a game over, it is 66% and 42%.
+- So the value net senses a death only 1–3 moves ahead, which is the range a 1-move search can still fix.
+
+### A/B on fresh seeds (256 games, seed `2025`, 20,000-move cap)
+
+Many games reach the cap, so score means are compressed. The comparison therefore uses deaths per move played. CI is a Poisson rate-ratio 95% CI against `base`.
+
+| Arm | Game overs | Moves / game over | Death rate vs base | 95% CI | Mean | Time |
+|---|---:|---:|---:|---|---:|---:|
+| `base`: 1-ply | 154 | 23,138 | 1.00 | | 1,507,448 | 8 min |
+| `fp32`: 1-ply, MLP head in fp32 | 122 | 31,300 | 0.74 | [0.58, 0.94] | 1,649,096 | 9 min |
+| search below 100, all moves | 121 | 31,065 | 0.74 | [0.59, 0.95] | 1,587,864 | 9 min |
+| **search below 110, top 8** | **70** | **63,305** | **0.37** | **[0.28, 0.48]** | 1,878,605 | 60 min |
+| search below 110, top 8, fp32 head | 94 | 44,232 | 0.52 | [0.40, 0.68] | 1,798,531 | 48 min |
+
+Search below 110 runs on about 2% of moves, and on about half of those it changes the move.
+
+The fp32 head was **not adopted**. On 726k identical states, the bf16 and fp32 heads differ in best Q by a mean of −0.001 (std 0.14). Both trigger the search at almost the same rate, so the precision only breaks near-ties. Its two results also point in opposite directions: it helped 1-ply but hurt search.
+
+Command: `uv run python scripts/ab_lookahead.py 256 2025 20000 out.jsonl base,fp32,search-100-all,search-110-8`, then `scripts/ab_compare.py out.jsonl`.
+
+### Long evaluation with search (the ticket's protocol: 64 games, seed `777`, 200,000-move cap)
+
+Command: `uv run python -m block_puzzle_ai.evaluate --agent models/rl_v1.pt --games 64 --seed 777 --max-moves 200000 --search-below 110 --top-k 8`.
+
+| | Mean | Median | Min | Max | Mean moves | Points / move | Time |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `rl_v1`, 1-ply (as above) | 2,595,820 | 1,831,945 | 31,110 | 11,750,010 | 23,958 | 108 | 26 min |
+| **`rl_v1` + search** | **5,985,303** | **4,408,550** | 60,930 | **21,739,880** | 55,168 | 108 | 94 min |
+
+**The mean rose 2.3×: +3.39M, bootstrap 95% CI [+2.08M, +4.75M]** (`scripts/bootstrap_mean.py`).
+- The search does not score faster: points per move stay at 108. All of the gain comes from surviving longer.
+- The best game was still alive at the 200,000-move cap with 21,739,880 points. The best game that ended in a real game over scored 17,306,820 points in 159,603 moves.
+
+| Still alive after | 1k moves | 5k | 20k | 50k | 100k | 200k (cap) |
+|---|---:|---:|---:|---:|---:|---:|
+| 1-ply (of 64) | 63 | 56 | 28 | 6 | 1 | 0 |
+| + search (of 64) | 63 | 62 | 45 | 29 | 11 | 1 |
+
+Score quantiles with search:
+
+| p10 | p25 | p50 | p75 | p90 |
+|---:|---:|---:|---:|---:|
+| 976k | 1.69M | 4.20M | 9.07M | 13.2M |

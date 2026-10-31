@@ -15,7 +15,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from block_puzzle_ai.agents import Agent, HeuristicAgent, RandomAgent, ValueAgent
+from block_puzzle_ai.agents import Agent, HeuristicAgent, LookaheadAgent, RandomAgent, ValueAgent
 from block_puzzle_ai.batch_env import BatchGame, move_from_index
 from block_puzzle_ai.features import best_per_env
 from block_puzzle_ai.game import N, Game, Move
@@ -23,10 +23,12 @@ from block_puzzle_ai.game import N, Game, Move
 STATIC = Path(__file__).parent / "static"
 ROOT = Path.cwd()
 DEVICE = "cpu"  # the GPU is usually busy training; one game is cheap on CPU
+SEARCH = "+search"  # agent id suffix: the checkpoint with lookahead search where it senses danger
+SEARCH_BELOW, TOP_K = 110.0, 8  # best arm of the seed-2025 A/B in docs/RESULTS.md
 
 app = FastAPI(title="Block Puzzle AI viewer")
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
-_agents: dict[tuple[str, float], Agent] = {}
+_agents: dict[tuple[str, float, bool], Agent] = {}
 
 
 def checkpoints() -> list[Path]:
@@ -39,12 +41,16 @@ def get_agent(agent_id: str) -> Agent:
         return RandomAgent(seed=random.randrange(2**31))
     if agent_id == "heuristic":
         return HeuristicAgent()
-    path = (ROOT / agent_id).resolve()
+    search = agent_id.endswith(SEARCH)
+    path = (ROOT / agent_id.removesuffix(SEARCH)).resolve()
     if path not in [p.resolve() for p in checkpoints()]:
         raise HTTPException(404, f"unknown agent {agent_id}")
-    key = (str(path), path.stat().st_mtime)
+    key = (str(path), path.stat().st_mtime, search)
     if key not in _agents:
-        _agents[key] = ValueAgent.from_checkpoint(path, DEVICE)
+        if search:
+            _agents[key] = LookaheadAgent.from_checkpoint(path, DEVICE, search_below=SEARCH_BELOW, top_k=TOP_K)
+        else:
+            _agents[key] = ValueAgent.from_checkpoint(path, DEVICE)
     return _agents[key]
 
 
@@ -63,6 +69,8 @@ def list_agents() -> list[dict]:
         if meta:
             label += f" (eval mean {meta['mean']:,.0f})"
         items.append({"id": rel, "label": label, "eval_mean": meta.get("mean")})
+        if rel.startswith("models/"):
+            items.append({"id": rel + SEARCH, "label": f"RL + lookahead · {rel}", "eval_mean": meta.get("mean")})
     items.sort(key=lambda a: a["eval_mean"] or 0, reverse=True)
     return items + [
         {"id": "heuristic", "label": "Heuristic baseline", "eval_mean": None},
@@ -114,30 +122,40 @@ class Session:
         self.agent: Agent | None = None
         self.seed = 0
         self.best = 0
+        self.searches = 0
         self.history: list[dict] = []
 
     def new_game(self, agent_id: str, seed: int | None) -> dict:
         self.agent = get_agent(agent_id)
         self.seed = seed if seed is not None else random.randrange(1_000_000)
         self.game = Game(seed=self.seed)
+        self.searches = 0
         return {"type": "state", "seed": self.seed, "state": snapshot(self.game), "best": self.best}
 
-    def choose(self) -> tuple[Move, int, float | None]:
+    def choose(self) -> tuple[Move, int, float | None, bool | None]:
+        """The agent's move, the number of legal moves, its value estimate and whether it searched."""
         env = BatchGame.from_game(self.game, DEVICE)
         cand = env.candidates()
         legal = int(cand.legal.sum())
         if isinstance(self.agent, ValueAgent):
             a, q, v = self.agent.q_values(env, cand)
-            slot, pos = best_per_env(1, a.index, q)
+            searched = None
+            if isinstance(self.agent, LookaheadAgent):
+                before = self.agent.searched
+                slot, pos = self.agent.act(env, cand)
+                searched = self.agent.searched > before
+                self.searches += searched
+            else:
+                slot, pos = best_per_env(1, a.index, q)
             chosen = (a.index[:, 1] == slot) & (a.index[:, 2] == pos)
             expected = float(q[chosen][0]) / self.agent.reward_scale  # points now + discounted future
-            return move_from_index(int(slot), int(pos)), legal, expected
+            return move_from_index(int(slot), int(pos)), legal, expected, searched
         slot, pos = self.agent.act(env, cand)
-        return move_from_index(int(slot[0]), int(pos[0])), legal, None
+        return move_from_index(int(slot[0]), int(pos[0])), legal, None, None
 
     def step(self) -> dict:
         game = self.game
-        move, legal, expected = self.choose()
+        move, legal, expected, searched = self.choose()
         group = game.pending[move.slot].group
         result = game.step(move)
         if result.done:
@@ -153,6 +171,8 @@ class Session:
             "lines": result.lines,
             "legal_moves": legal,
             "expected": expected,
+            "searched": searched,
+            "searches": self.searches,
             "state": snapshot(game),
             "best": max(self.best, game.score),
             "history": self.history[-40:],

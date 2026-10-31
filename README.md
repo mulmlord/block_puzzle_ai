@@ -2,7 +2,8 @@
 
 A reinforcement-learning agent for the Android game **Block Puzzle** (`game.puzzle.blockpuzzle` v6.1).
 The game rules were reverse-engineered from the shipped APK, re-implemented as a fast simulator,
-and used to train an agent that scores about **70× more than a hand-tuned heuristic**. Its best game scored **11.75 million** points.
+and used to train an agent that scores about **70× more than a hand-tuned heuristic**.
+With a danger-gated lookahead search on top, it averages **6.0 million** points per game, and one game reached **21.7 million**.
 A browser app lets you watch it play live.
 
 ![viewer](docs/media/viewer.gif)
@@ -18,7 +19,12 @@ All agents were evaluated on the same 128 fixed seeds, with games capped at 20,0
 | **RL `models/rl_v1.pt`** | **1,493,256** | **1,854,600** | **2,206,540** | 13,782 | **108** |
 
 - **Cap:** 54 of the 128 RL games were still alive at the 20,000-move cap. The table therefore *understates* the agent.
-- **Long run:** with the cap raised to 200,000 moves, all 64 games ended in a real game over. Mean **2.6M**, median 1.8M. **High score: 11,750,010 points in 108,511 moves.** See [`docs/RESULTS.md`](docs/RESULTS.md).
+- **Long run:** with the cap raised to 200,000 moves, all 64 games ended in a real game over. Mean **2.6M**, median 1.8M. Best game: 11,750,010 points in 108,511 moves.
+- **Lookahead search** (`--search-below 110 --top-k 8`, same 64 long games):
+  - Mean **6.0M** (2.3×; +3.4M, bootstrap 95% CI [+2.1M, +4.7M]), median 4.4M.
+  - Moves per game over rose from 24k to 56k.
+  - **High score: 21,739,880 points.** That game was still alive at the 200,000-move cap.
+  - See [`docs/RESULTS.md`](docs/RESULTS.md).
 - **Scoring efficiency:** the agent scores more points per move than the heuristic because it deliberately sets up multi-line clears. The game pays `50·L·(L+1)` for `L` simultaneous lines.
 
 ## How it works
@@ -35,17 +41,23 @@ All agents were evaluated on the same 128 fixed seeds, with games capped at 20,0
    - It plays greedily over all legal moves by `reward + γ·V(after-state)`.
    - It is trained by self-play on 512 parallel games with Watkins Q(λ) targets (γ = 0.99, λ = 0.8) and ε-greedy exploration.
    - The input features include fit maps that show where each remaining piece could still go.
+4. **Lookahead search** ([`agents.py`](src/block_puzzle_ai/agents.py), `LookaheadAgent`)
+   - It runs only where the best 1-ply Q drops below 110, which is about 2% of moves. Deaths almost always show up there 1–3 moves ahead.
+   - There it re-scores the 8 best moves by an expectimax over the next spawned piece, using the exact spawn probabilities.
+   - It needs no retraining.
 
 ## Usage
 
 ```bash
 uv sync
 
-# watch the AI play (http://127.0.0.1:8000)
+# watch the AI play (http://127.0.0.1:8000); pick "RL + lookahead" to watch the search
 uv run python -m block_puzzle_ai.viewer
 
 # evaluate an agent: random | heuristic | path/to/checkpoint.pt
 uv run python -m block_puzzle_ai.evaluate --agent models/rl_v1.pt --games 128 --max-moves 20000
+# ...with lookahead search where it senses danger (several times slower)
+uv run python -m block_puzzle_ai.evaluate --agent models/rl_v1.pt --search-below 110 --top-k 8
 
 # train (metrics in runs/<name>/metrics.jsonl, checkpoints best.pt / latest.pt)
 uv run python -m block_puzzle_ai.train --minutes 120 --out runs/main

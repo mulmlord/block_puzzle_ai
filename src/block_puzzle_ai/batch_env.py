@@ -71,6 +71,18 @@ def spawn_from_uniforms(
     return t.group_offset[group] + variant, new_history
 
 
+def spawn_distribution(t: Tables, score: torch.Tensor, history: torch.Tensor) -> torch.Tensor:
+    """Exact (B, P) probabilities of the piece spawn_from_uniforms draws, summed over its 1000 levels."""
+    r = torch.arange(1000, device=score.device)
+    level = (r.float()[None] / 1000.0 * score.float()[:, None]).long()  # float32 like the game
+    limit = t.n_groups - 3 + (level > 2999).long() + (level > 5999).long() + (level > 11999).long()
+    groups = torch.arange(t.n_groups, device=score.device)
+    p_group = ((groups < limit[..., None]).double() / limit[..., None]).mean(1)  # (B, G)
+    in_cooldown = (t.hard[history.clamp(min=0)] & (history >= 0)).any(1)
+    p_group = torch.where(in_cooldown[:, None], (groups < 8).double() / 8, p_group)
+    return (p_group[:, t.group] / t.group_size[t.group]).float()
+
+
 @dataclass
 class Candidates:
     """Every (slot, pos) move of every game, evaluated in one shot."""
@@ -152,6 +164,20 @@ class BatchGame:
         for name in ("board", "pending", "score", "moves", "lines_cleared", "history"):
             setattr(self, name, getattr(self, name)[idx])
         self.n = len(self.board)
+
+    @classmethod
+    def from_state(
+        cls, t: Tables, board: torch.Tensor, pending: torch.Tensor, score: torch.Tensor, history: torch.Tensor
+    ) -> BatchGame:
+        """Games starting from given states (used by lookahead search to score hypothetical positions)."""
+        env = cls.__new__(cls)
+        env.device, env.t, env.n = board.device, t, len(board)
+        env.rng = torch.Generator(env.device)
+        env.rng.manual_seed(0)
+        env.board, env.pending, env.score, env.history = board, pending, score, history
+        env.moves = torch.zeros_like(score)
+        env.lines_cleared = torch.zeros_like(score)
+        return env
 
     # ---- interop with the reference simulator ----------------------------------------------
     @classmethod

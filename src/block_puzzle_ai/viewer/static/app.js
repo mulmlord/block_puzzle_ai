@@ -212,7 +212,7 @@ async function newGame(seed) {
   $("seed").placeholder = `random (now ${msg.seed})`;
   $("overlay").classList.add("hidden");
   updateStats(msg.state, msg.best);
-  for (const id of ["legal", "points", "expected"]) $(id).textContent = "–";
+  for (const id of ["legal", "points", "expected", "search"]) $(id).textContent = "–";
   drawState(msg.state);
 }
 
@@ -274,6 +274,8 @@ function updateInsight(msg) {
   $("legal").textContent = msg.legal_moves;
   $("points").textContent = `+${msg.points}${msg.lines ? ` (${msg.lines} line${msg.lines > 1 ? "s" : ""})` : ""}`;
   $("expected").textContent = msg.expected == null ? "n/a" : Math.round(msg.expected).toLocaleString();
+  $("search").textContent =
+    msg.searched == null ? "n/a" : `${msg.searched ? "this move" : "not needed"} · ${msg.searches} this game`;
 }
 
 let toastTimer = null;

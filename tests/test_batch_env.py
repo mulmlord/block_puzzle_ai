@@ -2,7 +2,7 @@ import random
 
 import torch
 
-from block_puzzle_ai.batch_env import BatchGame, move_from_index, spawn_from_uniforms, tables_for
+from block_puzzle_ai.batch_env import BatchGame, move_from_index, spawn_distribution, spawn_from_uniforms, tables_for
 from block_puzzle_ai.game import N, Game, PieceGenerator
 from block_puzzle_ai.pieces import HARD_GROUPS, all_pieces
 
@@ -81,3 +81,21 @@ def test_batch_step_keeps_slot_order_and_tracks_score():
             kept = [before[b, s] for s in range(3) if s != slot[b]]
             assert env.pending[b, :2].tolist() == [int(k) for k in kept]
     assert torch.equal(total, env.score)
+
+
+def test_spawn_distribution_matches_sampled_spawns():
+    t = tables_for("cpu")
+    cases = [(0, [-1, -1, -1]), (3003, [-1, -1, -1]), (7000, [3, 1, -1]), (50000, [2, 0, 4]), (50000, [5, 8, 1])]
+    score = torch.tensor([s for s, _ in cases])
+    history = torch.tensor([h for _, h in cases])
+    probs = spawn_distribution(t, score, history)
+    assert torch.allclose(probs.sum(1), torch.ones(len(cases)))
+    assert torch.allclose(probs[0, t.group < 9].sum(), torch.tensor(1.0))  # score 0: only the 9 easy groups
+    assert (probs[4, t.group >= 8] == 0).all()  # hard group 8 in the history: forced to groups 0-7
+    n = 200_000
+    gen = torch.Generator().manual_seed(0)
+    for i in range(len(cases)):
+        u = torch.rand(n, 4, generator=gen, dtype=torch.float64)
+        piece, _ = spawn_from_uniforms(t, score[i].repeat(n), history[i].repeat(n, 1), u)
+        freq = torch.bincount(piece, minlength=t.n_pieces).float() / n
+        assert (freq - probs[i]).abs().max() < 0.005
