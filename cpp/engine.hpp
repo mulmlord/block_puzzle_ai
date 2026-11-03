@@ -6,6 +6,7 @@
 #pragma once
 
 #include <algorithm>
+#include <bit>
 #include <cstdint>
 #include <stdexcept>
 #include <vector>
@@ -118,6 +119,70 @@ inline void spawn_distribution(const Tables& t, int64_t score, const int history
             for (int g = 0; g < allowed; g++) p_group[g] += count[allowed] / 1000.0 / allowed;
     }
     for (int p = 0; p < t.n_pieces; p++) out[p] = p_group[t.group[p]] / t.group_size[t.group[p]];
+}
+
+// ---- board operations -------------------------------------------------------------------------
+
+struct State {
+    Board board = 0;
+    int pending[3] = {};  // piece ids; a move removes one slot and the spawned piece goes last
+    int64_t score = 0, moves = 0, lines = 0;
+    int history[3] = {-1, -1, -1};  // spawned groups, most recent first; persists across resets
+};
+
+struct Placed {
+    Board board;  // after placement and line clears
+    int points;
+    int lines;
+};
+
+inline constexpr Board ROW_MASK = 0x3FF;
+
+// Bitmask of the top-left positions where ``piece`` fits: q is blocked when some cell q + off is filled.
+// valid[] only holds positions whose bounding box fits, so the shifts never wrap across a row.
+inline Board legal_positions(const Tables& t, Board board, int piece) {
+    Board blocked = 0;
+    for (int k = 0; k < t.size[piece]; k++) blocked |= board >> t.offsets[piece][k];
+    return t.valid[piece] & ~blocked;
+}
+
+// Place ``piece`` at ``pos`` (legality is not checked), then clear every full row and column together.
+inline Placed apply(const Tables& t, Board board, int piece, int pos) {
+    const Board b = board | t.shape[piece] << pos;
+    Board cols = ROW_MASK;  // AND of the 10 row fields = full-column bits
+    Board cleared = 0;
+    int lines = 0;
+    for (int r = 0; r < N; r++) {
+        const Board row = b >> (N * r) & ROW_MASK;
+        cols &= row;
+        if (row == ROW_MASK) cleared |= ROW_MASK << (N * r), lines++;
+    }
+    if (cols) {
+        lines += std::popcount(static_cast<uint64_t>(cols));
+        for (int r = 0; r < N; r++) cleared |= cols << (N * r);
+    }
+    return {b & ~cleared, 10 * t.size[piece] + 50 * lines * (lines + 1), lines};
+}
+
+// Calls f(pos) for each set bit of ``mask``, ascending.
+template <class F>
+inline void for_each_bit(Board mask, F&& f) {
+    for (auto lo = static_cast<uint64_t>(mask); lo; lo &= lo - 1) f(std::countr_zero(lo));
+    for (auto hi = static_cast<uint64_t>(mask >> 64); hi; hi &= hi - 1) f(64 + std::countr_zero(hi));
+}
+
+inline bool has_legal_move(const Tables& t, const State& s) {
+    for (int slot = 0; slot < 3; slot++)
+        if (legal_positions(t, s.board, s.pending[slot])) return true;
+    return false;
+}
+
+// restart(): empty board, score 0, three fresh pieces spawned at score 0. The spawn history is kept.
+template <class Rng>
+void reset(const Tables& t, State& s, Rng& rng) {
+    s.board = 0;
+    s.score = s.moves = s.lines = 0;
+    for (int& piece : s.pending) piece = spawn(t, 0, s.history, rng);
 }
 
 }  // namespace bpa

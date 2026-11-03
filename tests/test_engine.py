@@ -8,8 +8,8 @@ import torch
 from block_puzzle_ai import _engine
 from block_puzzle_ai.batch_env import spawn_distribution as torch_spawn_distribution
 from block_puzzle_ai.batch_env import tables_for
-from block_puzzle_ai.engine import cpp_tables, spawn_sequence
-from block_puzzle_ai.game import PieceGenerator
+from block_puzzle_ai.engine import CppGame, cpp_tables, spawn_sequence
+from block_puzzle_ai.game import Game, PieceGenerator, clear_full_lines, placements, points_for
 from block_puzzle_ai.pieces import all_pieces, load_piece_table
 
 SEEDS = [0, 1, 42, 999, 2**32 - 1, 2**32 + 5, 2**40 + 123, 2**64 - 1]
@@ -76,3 +76,38 @@ def test_spawn_distribution_matches_batch_env(score):
 def test_tables_reject_bad_input(cells, groups):
     with pytest.raises(ValueError):
         _engine.Tables(cells, groups, [])
+
+
+def test_afterstates_match_reference_on_dense_boards():
+    rng, pieces, max_lines = random.Random(7), all_pieces(), 0
+    for i in range(1000):
+        density = 0.3 + 0.6 * i / 999
+        board = sum(1 << c for c in range(100) if rng.random() < density)
+        board, _, _ = clear_full_lines(board)  # reachable boards have no full line before a move
+        pending = [rng.choice(pieces) for _ in range(3)]
+        ref = Game(0)
+        ref.board, ref.pending = board, list(pending)
+        expected = []
+        for m in ref.legal_moves():
+            piece = pending[m.slot]
+            pl = next(p for p in placements(piece) if (p.row, p.col) == (m.row, m.col))
+            after, lines, _ = clear_full_lines(board | pl.mask, pl.lines)
+            expected.append((m, after, points_for(piece.size, lines), lines))
+            max_lines = max(max_lines, lines)
+        cpp = CppGame(0)
+        cpp.set_state(board, pending, 0, [])
+        assert cpp.legal_moves() == [m for m, *_ in expected]
+        assert cpp.afterstates() == expected
+        assert cpp.done == (not expected)
+    assert max_lines >= 3  # the boards did produce simultaneous row and column clears
+
+
+def test_set_state_rejects_bad_input():
+    g, p = CppGame(0), all_pieces()[:3]
+    for args in [(1 << 100, p, 0, []), (0, p, -1, []), (0, p, 0, [16]), (0, p, 0, [-2])]:
+        with pytest.raises(ValueError):
+            g.set_state(*args)
+    raw = _engine.Game(cpp_tables(), 0)
+    for pending in ([28, 0, 0], [-1, 0, 0], [0, 0]):
+        with pytest.raises(ValueError):
+            raw.set_state(0, 0, pending, 0, [-1, -1, -1])
