@@ -1,5 +1,6 @@
 // Python bindings: block_puzzle_ai._engine (wrapped by block_puzzle_ai.engine)
 #include <nanobind/nanobind.h>
+#include <nanobind/ndarray.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
 
@@ -9,6 +10,7 @@
 #include <vector>
 
 #include "engine.hpp"
+#include "ntuple.hpp"
 #include "rng.hpp"
 
 namespace nb = nanobind;
@@ -113,6 +115,19 @@ private:
     std::variant<bpa::PyRandom, bpa::Xoshiro256> rng_{std::in_place_type<bpa::Xoshiro256>, 0};
 };
 
+bpa::Afterstate make_afterstate(const Tables& t, uint64_t lo, uint64_t hi, const std::vector<int>& remaining, bool cooldown) {
+    if (hi >> (bpa::CELLS - 64)) throw std::invalid_argument("board has bits beyond cell 99");
+    if (remaining.size() != 2) throw std::invalid_argument("remaining must hold 2 piece ids");
+    bpa::Afterstate a;
+    a.board = static_cast<bpa::Board>(hi) << 64 | lo;
+    for (int i = 0; i < 2; i++) {
+        if (remaining[i] < 0 || remaining[i] >= t.n_pieces) throw std::invalid_argument("remaining piece id out of range");
+        a.remaining[i] = remaining[i];
+    }
+    a.cooldown = cooldown;
+    return a;
+}
+
 }  // namespace
 
 NB_MODULE(_engine, m) {
@@ -159,6 +174,30 @@ NB_MODULE(_engine, m) {
         .def_prop_ro("moves", &Game::moves)
         .def_prop_ro("lines_cleared", &Game::lines)
         .def_prop_ro("done", &Game::done);
+
+    nb::class_<bpa::NTuple>(m, "NTuple", "n-tuple after-state value function over shared float32 weights")
+        .def(nb::init<const Tables&, std::vector<std::vector<int>>>(), nb::arg("tables"), nb::arg("tuples"))
+        .def_prop_ro("n_weights", &bpa::NTuple::n_weights)
+        .def_prop_ro("n_lookups", &bpa::NTuple::n_lookups)
+        .def_prop_ro("tuples", &bpa::NTuple::tuples)
+        .def_prop_ro(
+            "weights",
+            [](bpa::NTuple& n) {
+                return nb::ndarray<nb::numpy, float, nb::ndim<1>>(n.weights(), {n.n_weights()}, nb::handle());
+            },
+            nb::rv_policy::reference_internal, "writable float32 view of the weights (keeps the model alive)")
+        .def(
+            "value",
+            [](const bpa::NTuple& n, uint64_t lo, uint64_t hi, const std::vector<int>& remaining, bool cooldown) {
+                return n.value(make_afterstate(n.tables(), lo, hi, remaining, cooldown));
+            },
+            nb::arg("board_lo"), nb::arg("board_hi"), nb::arg("remaining"), nb::arg("cooldown"))
+        .def(
+            "update",
+            [](bpa::NTuple& n, uint64_t lo, uint64_t hi, const std::vector<int>& remaining, bool cooldown, double target,
+               float alpha) { n.update(make_afterstate(n.tables(), lo, hi, remaining, cooldown), target, alpha); },
+            nb::arg("board_lo"), nb::arg("board_hi"), nb::arg("remaining"), nb::arg("cooldown"), nb::arg("target"),
+            nb::arg("alpha"), "TD step: each looked-up weight += alpha * (target - V) / n_lookups");
 
     m.def(
         "random_play",

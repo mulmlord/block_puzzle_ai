@@ -8,9 +8,14 @@ twins of the C++ symmetries that the tests check the engine against.
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 
+from block_puzzle_ai import _engine
+from block_puzzle_ai.engine import cpp_tables
 from block_puzzle_ai.game import N
 from block_puzzle_ai.pieces import all_pieces
+
+_LOW64 = (1 << 64) - 1
 
 
 def transform_cell(t: int, r: int, c: int) -> tuple[int, int]:
@@ -83,3 +88,13 @@ def shapes_to_tuples(names: list[str]) -> list[list[int]]:
 def fit_bucket(n: int) -> int:
     """Bucket of a placement count: 0, 1, 2, 3-4, 5-8, 9-16, 17-32, 33+ -> 0..7."""
     return n if n < 3 else min(7, (n - 1).bit_length() + 1)
+
+
+def make_model(tuples: list[list[int]], table: str = "new") -> _engine.NTuple:
+    """An n-tuple model with zero weights over the given tuples (absolute cell lists)."""
+    return _engine.NTuple(cpp_tables(table), tuples)
+
+
+def value(model: _engine.NTuple, board: int, remaining: Sequence[int], cooldown: bool) -> float:
+    """V of an after-state: a 100-bit board, the 2 remaining piece ids and the cooldown flag."""
+    return model.value(board & _LOW64, board >> 64, list(remaining), cooldown)
