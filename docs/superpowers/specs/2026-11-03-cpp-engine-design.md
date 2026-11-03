@@ -117,7 +117,7 @@ Both expose `randrange(n)` and are template parameters of `step`, `reset` and `s
 ### Random play (benchmark and smoke test)
 
 `random_play(tables, threads, moves_per_thread, seed) → (moves, games, seconds)`:
-- Each thread owns a `Xoshiro256`, seeded with `splitmix64(seed + thread)`, and plays games one after another.
+- Each thread owns a `Xoshiro256`, seeded with the (thread + 1)-th output of a splitmix64 stream started at `seed`. (`splitmix64(seed + thread)` was the original plan; the final review found that it makes runs with neighbouring seeds share all but one thread stream.) Each thread plays games one after another.
 - Each move picks uniformly among all legal `(slot, pos)` moves: count the bits of the three legal masks, draw an index, then select the matching bit.
 - A game that has no legal move is reset.
 - There is no shared state and no locking. The GIL is released.

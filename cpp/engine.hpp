@@ -257,8 +257,11 @@ inline PlayStats play_random(const Tables& t, int threads, uint64_t moves_per_th
         std::vector<std::jthread> pool;
         for (int i = 0; i < threads; i++) {
             pool.emplace_back([&, i] {
-                uint64_t x = seed + static_cast<uint64_t>(i);
-                Xoshiro256 rng(splitmix64(x));
+                // thread i takes the (i + 1)-th output of a splitmix64 stream started at ``seed``, so runs with
+                // neighbouring seeds share no thread streams (splitmix64(seed + i) would)
+                uint64_t x = seed, thread_seed = 0;
+                for (int k = 0; k <= i; k++) thread_seed = splitmix64(x);
+                Xoshiro256 rng(thread_seed);
                 PlayStats st;
                 State s;
                 reset(t, s, rng);

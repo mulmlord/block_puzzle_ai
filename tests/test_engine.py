@@ -175,3 +175,12 @@ def test_random_play_edge_counts():
     with pytest.raises(ValueError):
         random_play(0, 100)
     assert random_play(3, 0)[:2] == (0, 3)
+
+
+def test_random_play_seeds_give_independent_streams():
+    """Thread 1 of seed s must not replay thread 0 of seed s + 1 (as splitmix64(seed + thread) did)."""
+    shared = [
+        random_play(2, 5_000, seed=s)[1] == random_play(1, 5_000, seed=s)[1] + random_play(1, 5_000, seed=s + 1)[1]
+        for s in range(5)
+    ]
+    assert not all(shared)
