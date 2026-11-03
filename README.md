@@ -46,6 +46,7 @@ The 20,000-move cap *understates* the RL agents: 54 of the 128 `rl_v1` games wer
 2. **Simulator** ([`game.py`](src/block_puzzle_ai/game.py), [`batch_env.py`](src/block_puzzle_ai/batch_env.py))
    - `game.py` is a readable bitboard reference implementation.
    - `batch_env.py` is a vectorized PyTorch twin that evaluates all 3×100 candidate moves of hundreds of games at once on the GPU. Tests check that both behave identically.
+   - `cpp/` (`block_puzzle_ai.engine`) is a C++ bitboard twin of `game.py` for CPU work. It runs about 107M random moves/s on 24 threads and replays `game.py` games exactly ([results](docs/RESULTS.md#c-engine-ticket-11)).
 3. **Agent** ([`train.py`](src/block_puzzle_ai/train.py))
    - It learns an *after-state value* `V(board after the move + remaining pieces)` with a small residual CNN.
    - It plays greedily over all legal moves by `reward + γ·V(after-state)`.
