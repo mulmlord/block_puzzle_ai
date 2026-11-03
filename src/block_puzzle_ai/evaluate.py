@@ -50,7 +50,10 @@ def run_games(agent: Agent, n_games: int, device: str, seed: int, max_moves: int
 
 
 def summarize(results: list[GameResult]) -> dict:
-    """Score statistics plus moves per game over, which stays meaningful when games hit the move cap."""
+    """Score statistics plus the death rate, which stays meaningful when games hit the move cap.
+
+    The risk of a game over is about constant per move, so moves_per_death estimates the expected moves until death.
+    """
     scores = [r.score for r in results]
     moves = sum(r.moves for r in results)
     deaths = sum(not r.truncated for r in results)
@@ -66,6 +69,7 @@ def summarize(results: list[GameResult]) -> dict:
         "truncated": len(results) - deaths,
         "deaths": deaths,
         "moves_per_death": moves / max(1, deaths),
+        "deaths_per_m_moves": deaths / max(1, moves) * 1e6,
     }
 
 
@@ -75,18 +79,24 @@ def main() -> None:
     parser.add_argument("--games", type=int, default=256)
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument("--max-moves", type=int, default=100_000)
+    parser.add_argument("--search", action="store_true", help="lookahead search with the checkpoint's own gate")
     parser.add_argument("--search-below", type=float, help="lookahead search where the best 1-ply Q is below this")
-    parser.add_argument("--top-k", type=int, help="search only the k best 1-ply moves")
+    parser.add_argument("--top-k", type=int, default=8, help="search only the k best 1-ply moves (0 = all)")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--json", action="store_true", help="print the summary as JSON")
     args = parser.parse_args()
 
-    agent = make_agent(args.agent, args.device, args.search_below, args.top_k)
+    agent = make_agent(args.agent, args.device, args.search_below, args.top_k or None, args.search)
     start = time.perf_counter()
     results = run_games(agent, args.games, args.device, args.seed, args.max_moves)
     summary = summarize(results) | {"agent": agent.name, "seconds": round(time.perf_counter() - start, 1)}
     if isinstance(agent, LookaheadAgent):
-        summary |= {"searched": agent.searched, "search_changed_move": agent.changed}
+        summary |= {
+            "search_below": agent.search_below,
+            "top_k": agent.top_k,
+            "searched": agent.searched,
+            "search_changed_move": agent.changed,
+        }
     if args.json:
         print(json.dumps(summary | {"results": [asdict(r) for r in results]}))
     else:

@@ -8,7 +8,11 @@ m_{t+1} = max_a [r_a + gamma * V(x_a)] seen while acting:
     G_t = m_{t+1}                                             if the game was cut or a_{t+1} explored
     G_t = (1 - lam) * m_{t+1} + lam * (r_{t+1} + gamma * G_{t+1})   otherwise
 
+The run lasts --minutes (or --total-moves); the learning rate warms up, then decays on a cosine to --lr-end.
+best.pt is chosen on eval moves per game over, which the eval move cap does not saturate.
+
 uv run python -m block_puzzle_ai.train --minutes 90 --out runs/main
+uv run python -m block_puzzle_ai.train --resume runs/main      # continue an interrupted run
 """
 
 from __future__ import annotations
@@ -41,22 +45,28 @@ class Config:
     rollout: int = 16
     gamma: float = 0.99
     lam: float = 0.8
-    reward_scale: float = 0.01
+    reward_scale: float = 0.01  # keep reward_scale = 1 - gamma so that V stays near points per move (~108)
     lr: float = 3e-4
+    lr_end: float = 3e-5
+    warmup_moves: int = 1_000_000
     epochs: int = 2
     minibatch: int = 2048
     eps_start: float = 0.10
-    eps_end: float = 0.005
+    eps_end: float = 0.001
     eps_decay_moves: int = 4_000_000
     max_moves: int = 50_000
+    restart_frac: float = 0.0  # share of finished games restarted from a state 50-500 moves before a game over
     channels: int = 32
     blocks: int = 3
     hidden: int = 256
-    eval_minutes: float = 10.0
-    eval_games: int = 128
+    fp32_head: bool = True  # also switched on for an --init net; see ValueNet.set_fp32_head
+    eval_minutes: float = 30.0  # also writes a snapshot to ckpt/
+    eval_games: int = 256
     eval_max_moves: int = 20_000
     eval_seed: int = 2024
+    save_minutes: float = 10.0  # resume.pt
     minutes: float = 60.0
+    total_moves: int = 0  # if set, the run lasts this many moves instead of `minutes`
     seed: int = 0
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     init: str | None = None
@@ -112,6 +122,68 @@ def lambda_returns(r, best, terminal, cut, explored, cfg: Config) -> torch.Tenso
     return g
 
 
+def learning_rate(cfg: Config, progress: float, moves: int) -> float:
+    """Linear warm-up over the first ``warmup_moves``, then a cosine from lr to lr_end over the run (progress 0..1)."""
+    cosine = cfg.lr_end + 0.5 * (cfg.lr - cfg.lr_end) * (1 + math.cos(math.pi * min(1.0, progress)))
+    return cosine * min(1.0, (moves + 1) / cfg.warmup_moves) if cfg.warmup_moves else cosine
+
+
+class RestartPool:
+    """Restarts finished games from states shortly before a game over, where deaths are learned (#10, technique 3).
+
+    Every ``every`` steps all games are copied into a ring of ``depth`` snapshots. When a game ends in a game over,
+    its snapshots from ``every`` to ``every * depth`` moves earlier join a pool of ``capacity`` states, and each
+    finished game restarts from a random pool state with probability ``frac`` (otherwise from an empty board).
+    """
+
+    def __init__(self, env: BatchGame, frac: float, every: int = 50, depth: int = 10, capacity: int = 1 << 16):
+        self.frac, self.every, self.depth, self.capacity = frac, every, depth, capacity
+        state = env.state()
+        self.ring = {k: v.new_zeros(depth, *v.shape) for k, v in state.items()}
+        self.ring_game = torch.full((depth, env.n), -1, dtype=torch.long, device=env.device)
+        self.pool = {k: v.new_zeros(capacity, *v.shape[1:]) for k, v in state.items()}
+        self.game = torch.zeros(env.n, dtype=torch.long, device=env.device)  # games each env has finished
+        self.restarted = torch.zeros(env.n, dtype=torch.bool, device=env.device)  # current game came from the pool
+        self.size = self.head = self.steps = self.restarts = 0
+
+    def snapshot(self, env: BatchGame) -> None:
+        """Call once per step, on states that are not game over."""
+        if self.steps % self.every == 0:
+            slot = self.steps // self.every % self.depth
+            for k, v in env.state().items():
+                self.ring[k][slot] = v
+            self.ring_game[slot] = self.game
+        self.steps += 1
+
+    def reset(self, env: BatchGame, done: torch.Tensor, terminal: torch.Tensor, rng: torch.Generator) -> None:
+        """env.reset(done), then move a share of those games onto pool states; ``terminal`` marks the game overs."""
+        age = env.moves - self.ring["moves"]
+        new = (self.ring_game == self.game) & terminal & (age >= self.every)
+        n = int(new.sum())
+        if n:
+            idx = (self.head + torch.arange(n, device=env.device)) % self.capacity
+            for k, v in self.ring.items():
+                self.pool[k][idx] = v[new]
+            self.head = (self.head + n) % self.capacity
+            self.size = min(self.capacity, self.size + n)
+        env.reset(done)
+        self.game[done] += 1
+        self.restarted[done] = False
+        if not self.size:
+            return
+        idx = (done & (torch.rand(env.n, generator=rng, device=env.device) < self.frac)).nonzero().squeeze(1)
+        src = torch.randint(self.size, (len(idx),), generator=rng, device=env.device)
+        env.set_state(idx, {k: v[src] for k, v in self.pool.items()})
+        self.restarted[idx] = True
+        self.restarts += len(idx)
+
+    def state_dict(self) -> dict:
+        return dict(vars(self))
+
+    def load_state_dict(self, state: dict) -> None:
+        vars(self).update(state)
+
+
 class Learner:
     """Regresses the net on a rollout's targets: ``cfg.epochs`` passes over shuffled minibatches."""
 
@@ -122,9 +194,11 @@ class Learner:
         # CUDA graphs over forward + backward: each minibatch is launch-bound, and they all have one size
         self.forward = torch.compile(net, mode="reduce-overhead", dynamic=False) if cuda else net
 
-    def update(self, planes: torch.Tensor, globals_: torch.Tensor, target: torch.Tensor) -> float:
+    def update(self, planes: torch.Tensor, globals_: torch.Tensor, target: torch.Tensor, lr: float) -> float:
         """One update on (planes, globals_) -> target; returns the mean minibatch loss with a single host sync."""
         cuda = target.is_cuda
+        for group in self.opt.param_groups:
+            group["lr"] = lr
         losses = []
         for _ in range(self.cfg.epochs):
             perm = torch.randperm(len(target), device=target.device, generator=self.rng)
@@ -140,30 +214,58 @@ class Learner:
         return float(torch.stack(losses).mean())
 
 
-def train(cfg: Config, out: Path) -> None:
+def train(cfg: Config, out: Path, resume: bool = False) -> None:
+    """Train into ``out``; with ``resume``, continue the run saved in out/resume.pt."""
     out.mkdir(parents=True, exist_ok=True)
-    (out / "config.json").write_text(json.dumps(asdict(cfg), indent=2))
+    if not resume:
+        (out / "config.json").write_text(json.dumps(asdict(cfg), indent=2))
     device = torch.device(cfg.device)
     torch.manual_seed(cfg.seed)
     env = BatchGame(cfg.envs, device, seed=cfg.seed)
-    if cfg.init:
+    if resume:
+        net, saved = load_checkpoint(out / "resume.pt", device)
+    elif cfg.init:
         net, _ = load_checkpoint(cfg.init, device)
+        net.set_fp32_head(cfg.fp32_head)
     else:
-        net = ValueNet(n_globals(env.t), cfg.channels, cfg.blocks, cfg.hidden).to(device, memory_format=torch.channels_last)
+        net = ValueNet(n_globals(env.t), cfg.channels, cfg.blocks, cfg.hidden, cfg.fp32_head)
+        net = net.to(device, memory_format=torch.channels_last)
     rng = torch.Generator(device).manual_seed(cfg.seed + 1)
     learner = Learner(net, cfg, rng)
+    pool = RestartPool(env, cfg.restart_frac) if cfg.restart_frac > 0 else None
 
-    metrics_file = (out / "metrics.jsonl").open("a")
     recent = deque(maxlen=500)
     total_moves = 0
     episodes = 0
     best_train = 0
     best_eval = -math.inf
-    start = time.perf_counter()
-    last_eval = start
-    last_log = start
+    elapsed = 0.0
+    if resume:
+        state = saved["train"]
+        learner.opt.load_state_dict(state["opt"])
+        total_moves, episodes, best_train, best_eval, elapsed = (
+            state[k] for k in ("moves", "episodes", "best_train", "best_eval", "elapsed")
+        )
+        recent.extend(map(tuple, state["recent"].tolist()))
+        rng.set_state(state["rng"].cpu())
+        env.rng.set_state(state["env_rng"].cpu())
+        env.set_state(torch.arange(env.n, device=device), state["env"])
+        if pool:
+            pool.load_state_dict(state["pool"])
+        # drop what was logged after the save
+        records = (out / "metrics.jsonl").read_text().splitlines()
+        kept = [r for r in records if json.loads(r)["moves"] <= total_moves]
+        (out / "metrics.jsonl").write_text("".join(r + "\n" for r in kept))
+    metrics_file = (out / "metrics.jsonl").open("a")
+    start = time.perf_counter() - elapsed
+    last_eval = last_log = last_save = time.perf_counter()
     log_moves = 0
     t_steps, n = cfg.rollout, cfg.envs
+
+    def progress() -> float:
+        if cfg.total_moves:
+            return total_moves / cfg.total_moves
+        return (time.perf_counter() - start) / (cfg.minutes * 60)
 
     def log(record: dict) -> None:
         record |= {"elapsed_min": round((time.perf_counter() - start) / 60, 2), "moves": total_moves}
@@ -177,11 +279,31 @@ def train(cfg: Config, out: Path) -> None:
         agent = ValueAgent(net, cfg.gamma, cfg.reward_scale)
         summary = summarize(run_games(agent, cfg.eval_games, cfg.device, cfg.eval_seed, cfg.eval_max_moves))
         net.train()
-        save_checkpoint(out / "latest.pt", net, gamma=cfg.gamma, reward_scale=cfg.reward_scale, eval=summary)
-        if summary["mean"] > best_eval:
-            best_eval = summary["mean"]
-            save_checkpoint(out / "best.pt", net, gamma=cfg.gamma, reward_scale=cfg.reward_scale, eval=summary)
-        log({"type": "eval"} | {f"eval_{k}": v for k, v in summary.items()} | {"best_eval_mean": best_eval})
+        meta = {"gamma": cfg.gamma, "reward_scale": cfg.reward_scale, "eval": summary}
+        save_checkpoint(out / "latest.pt", net, **meta)
+        save_checkpoint(out / "ckpt" / f"{total_moves // 1_000_000:05d}M.pt", net, **meta)
+        if summary["moves_per_death"] > best_eval:
+            best_eval = summary["moves_per_death"]
+            save_checkpoint(out / "best.pt", net, **meta)
+        log({"type": "eval"} | {f"eval_{k}": v for k, v in summary.items()} | {"best_eval_moves_per_death": best_eval})
+
+    def save() -> None:
+        """Everything needed to continue the run; written to a temp file first so a crash cannot corrupt it."""
+        state = {
+            "opt": learner.opt.state_dict(),
+            "moves": total_moves,
+            "episodes": episodes,
+            "best_train": best_train,
+            "best_eval": best_eval,
+            "elapsed": time.perf_counter() - start,
+            "recent": torch.tensor(list(recent), dtype=torch.long).view(-1, 2),
+            "rng": rng.get_state(),
+            "env_rng": env.rng.get_state(),
+            "env": env.state(),
+            "pool": pool.state_dict() if pool else None,
+        }
+        save_checkpoint(out / "resume.tmp", net, gamma=cfg.gamma, reward_scale=cfg.reward_scale, train=state)
+        (out / "resume.tmp").replace(out / "resume.pt")
 
     def observe() -> tuple[StateEval, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Evaluate the reached states, restarting finished games first so the net runs once per step.
@@ -195,12 +317,16 @@ def train(cfg: Config, out: Path) -> None:
         cut_best = evaluate_state(env, net, cfg, cand).best if cut.any() else None  # rare: bootstrap before reset
         done = terminal | cut
         if done.any():
-            for i in done.nonzero().squeeze(1).tolist():
+            fresh = done if pool is None else done & ~pool.restarted  # games from the pool skew the score stats
+            for i in fresh.nonzero().squeeze(1).tolist():
                 score = int(env.score[i])
                 recent.append((score, int(env.moves[i])))
                 best_train = max(best_train, score)
             episodes += int(done.sum())
-            env.reset(done)
+            if pool:
+                pool.reset(env, done, terminal, rng)
+            else:
+                env.reset(done)
             cand = env.candidates()
         ev = evaluate_state(env, net, cfg, cand)
         best = torch.where(terminal, 0.0, ev.best)
@@ -209,7 +335,7 @@ def train(cfg: Config, out: Path) -> None:
         return ev, best, terminal, cut
 
     ev, *_ = observe()
-    while time.perf_counter() - start < cfg.minutes * 60:
+    while progress() < 1:
         planes = torch.zeros(t_steps, n, 3, 10, 10, dtype=torch.bool, device=device)
         globals_ = torch.zeros(t_steps, n, ev.a.globals.shape[1], device=device)
         r = torch.zeros(t_steps, n, device=device)
@@ -226,11 +352,14 @@ def train(cfg: Config, out: Path) -> None:
             r[t] = ev.a.points[rows] * cfg.reward_scale
             env.step(ev.cand, move // CELLS, move % CELLS)
             ev, best[t + 1], terminal[t + 1], cut[t + 1] = observe()
+            if pool:
+                pool.snapshot(env)
+        lr = learning_rate(cfg, progress(), total_moves)
         total_moves += t_steps * n
         log_moves += t_steps * n
 
         target = lambda_returns(r, best, terminal, cut, explored, cfg).flatten()
-        loss = learner.update(planes.flatten(0, 1), globals_.flatten(0, 1), target)
+        loss = learner.update(planes.flatten(0, 1), globals_.flatten(0, 1), target, lr)
 
         now = time.perf_counter()
         if now - last_log > 30 and recent:
@@ -241,6 +370,7 @@ def train(cfg: Config, out: Path) -> None:
                     "moves_per_s": round(log_moves / (now - last_log)),
                     "episodes": episodes,
                     "eps": eps,
+                    "lr": lr,
                     "loss": loss,
                     "recent_mean": statistics.fmean(scores),
                     "recent_median": statistics.median(scores),
@@ -248,23 +378,38 @@ def train(cfg: Config, out: Path) -> None:
                     "best_train_score": best_train,
                     "value_mean": float(target.mean()),
                 }
+                | ({"pool": pool.size, "restarts": pool.restarts} if pool else {})
             )
             last_log, log_moves = now, 0
         if now - last_eval > cfg.eval_minutes * 60:
             run_eval()
             last_eval = time.perf_counter()
+        if now - last_save > cfg.save_minutes * 60:
+            save()
+            last_save = time.perf_counter()
     run_eval()
+    save()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--out", default="runs/main")
+    parser.add_argument(
+        "--resume", metavar="RUN_DIR", help="continue RUN_DIR with its saved config (other options are ignored)"
+    )
     for field, value in asdict(Config()).items():
-        kind = type(value) if value is not None else str
-        parser.add_argument(f"--{field.replace('_', '-')}", type=kind, default=value)
+        flag = f"--{field.replace('_', '-')}"
+        if isinstance(value, bool):
+            parser.add_argument(flag, action=argparse.BooleanOptionalAction, default=value)
+        else:
+            parser.add_argument(flag, type=type(value) if value is not None else str, default=value)
     args = vars(parser.parse_args())
-    out = Path(args.pop("out"))
-    train(Config(**args), out)
+    out, resume = Path(args.pop("out")), args.pop("resume")
+    if resume:
+        out = Path(resume)
+        train(Config(**json.loads((out / "config.json").read_text())), out, resume=True)
+    else:
+        train(Config(**args), out)
 
 
 if __name__ == "__main__":

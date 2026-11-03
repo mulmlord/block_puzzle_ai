@@ -24,9 +24,10 @@ class ResBlock(nn.Module):
 
 
 class ValueNet(nn.Module):
-    def __init__(self, n_globals: int, channels: int = 32, blocks: int = 3, hidden: int = 256):
+    def __init__(self, n_globals: int, channels: int = 32, blocks: int = 3, hidden: int = 256, fp32_head: bool = False):
         super().__init__()
         self.config = {"n_globals": n_globals, "channels": channels, "blocks": blocks, "hidden": hidden}
+        self.set_fp32_head(fp32_head)
         self.stem = nn.Conv2d(3, channels, 3, padding=1)
         self.blocks = nn.Sequential(*[ResBlock(channels) for _ in range(blocks)])
         self.reduce = nn.Conv2d(channels, 8, 1)
@@ -39,11 +40,25 @@ class ValueNet(nn.Module):
         )
         self._graphed_forward = None  # compiled lazily on the first CUDA predict; a plain function, not in state_dict
 
+    def set_fp32_head(self, on: bool) -> None:
+        """Run the MLP head in fp32 under bf16 autocast. bf16 rounds V ~ 100 to steps of 0.5, which with
+        reward_scale 0.01 is 50 points: coarser than the median gap between the two best moves (~24 points).
+        Costs ~5% inference time. Off for checkpoints saved without it (rl_v1), so they play as they were trained.
+        """
+        self.fp32_head = on
+        if on:
+            self.config["fp32_head"] = True
+        else:
+            self.config.pop("fp32_head", None)
+
     def forward(self, planes: torch.Tensor, globals_: torch.Tensor) -> torch.Tensor:
         planes = planes.contiguous(memory_format=torch.channels_last)  # ~1.5x faster convs on GPU
         x = self.blocks(F.relu(self.stem(planes)))
-        x = F.relu(self.reduce(x)).flatten(1)
-        return self.head(torch.cat([x, globals_], 1)).squeeze(1)
+        x = torch.cat([F.relu(self.reduce(x)).flatten(1), globals_], 1)
+        if self.fp32_head:
+            with torch.autocast(x.device.type, enabled=False):
+                return self.head(x.float()).squeeze(1)
+        return self.head(x).squeeze(1)
 
     @torch.no_grad()
     def predict(self, planes: torch.Tensor, globals_: torch.Tensor) -> torch.Tensor:

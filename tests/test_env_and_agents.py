@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 
-from block_puzzle_ai.agents import HeuristicAgent, LookaheadAgent, RandomAgent, ValueAgent, choose_move
+from block_puzzle_ai.agents import HeuristicAgent, LookaheadAgent, RandomAgent, ValueAgent, choose_move, make_agent
 from block_puzzle_ai.batch_env import BatchGame, spawn_distribution
 from block_puzzle_ai.env import BlockPuzzleEnv
 from block_puzzle_ai.evaluate import run_games, summarize
@@ -141,3 +141,13 @@ def test_lookahead_without_danger_plays_like_value_agent():
     assert all(torch.equal(x, y) for x, y in zip(plain.act(env, cand), never.act(env, cand)))
     slot, pos = always.act(env, cand)
     assert cand.legal[torch.arange(3), slot, pos].all() and always.searched == 3
+
+
+def test_lookahead_gate_comes_from_the_checkpoint(tmp_path):
+    net = ValueNet(n_globals(BatchGame(1, seed=0).t), channels=4, blocks=1, hidden=8)
+    save_checkpoint(tmp_path / "old.pt", net, gamma=0.99, reward_scale=0.01)
+    save_checkpoint(tmp_path / "new.pt", net, gamma=0.997, reward_scale=0.003, search_below=115.0)
+    assert LookaheadAgent.from_checkpoint(tmp_path / "old.pt").search_below == LookaheadAgent.DEFAULT_GATE
+    assert LookaheadAgent.from_checkpoint(tmp_path / "new.pt").search_below == 115.0
+    assert LookaheadAgent.from_checkpoint(tmp_path / "new.pt", search_below=90.0).search_below == 90.0
+    assert make_agent(str(tmp_path / "new.pt"), search=True).search_below == 115.0

@@ -1,5 +1,6 @@
-"""A/B: rl_v1 1-ply vs fp32 head vs gated lookahead, same seeds; one JSON line per arm.
+"""A/B: 1-ply vs fp32 head vs gated lookahead, same seeds; one JSON line per arm.
 
+ab_lookahead.py GAMES SEED CAP OUT.jsonl ARMS [CHECKPOINT (default models/rl_v1.pt)]
 Arm names: base | fp32 | search-<below>-<k|all>, with ":fp32" appended to run a search arm with the fp32 head.
 """
 import json
@@ -14,6 +15,7 @@ from block_puzzle_ai.model import ValueNet
 
 GAMES, SEED, CAP, OUT = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
 arms = sys.argv[5].split(",")
+CKPT = sys.argv[6] if len(sys.argv) > 6 else "models/rl_v1.pt"
 bf16_forward = ValueNet.forward
 
 
@@ -31,9 +33,9 @@ def make(arm):
     if arm.startswith("search"):
         _, below, k = arm.split(":")[0].split("-")
         return LookaheadAgent.from_checkpoint(
-            "models/rl_v1.pt", "cuda", search_below=float(below), top_k=None if k == "all" else int(k)
+            CKPT, "cuda", search_below=float(below), top_k=None if k == "all" else int(k)
         )
-    return ValueAgent.from_checkpoint("models/rl_v1.pt", "cuda")
+    return ValueAgent.from_checkpoint(CKPT, "cuda")
 
 
 for arm in arms:

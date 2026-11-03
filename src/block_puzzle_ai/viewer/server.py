@@ -24,7 +24,7 @@ STATIC = Path(__file__).parent / "static"
 ROOT = Path.cwd()
 DEVICE = "cpu"  # the GPU is usually busy training; one game is cheap on CPU
 SEARCH = "+search"  # agent id suffix: the checkpoint with lookahead search where it senses danger
-SEARCH_BELOW, TOP_K = 110.0, 8  # best arm of the seed-2025 A/B in docs/RESULTS.md
+TOP_K = 8  # best arm of the seed-2025 A/B in docs/RESULTS.md; the gate comes from the checkpoint
 
 app = FastAPI(title="Block Puzzle AI viewer")
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
@@ -48,7 +48,7 @@ def get_agent(agent_id: str) -> Agent:
     key = (str(path), path.stat().st_mtime, search)
     if key not in _agents:
         if search:
-            _agents[key] = LookaheadAgent.from_checkpoint(path, DEVICE, search_below=SEARCH_BELOW, top_k=TOP_K)
+            _agents[key] = LookaheadAgent.from_checkpoint(path, DEVICE, top_k=TOP_K)
         else:
             _agents[key] = ValueAgent.from_checkpoint(path, DEVICE)
     return _agents[key]

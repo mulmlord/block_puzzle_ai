@@ -84,7 +84,7 @@ target = torch.rand(cfg.rollout * cfg.envs, device=dev)
 
 
 def update():
-    learner.update(planes, globals_, target)
+    learner.update(planes, globals_, target, lr=1e-9)
 
 
 update()

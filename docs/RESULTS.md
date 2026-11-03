@@ -147,3 +147,152 @@ The CUDA-graphed kernels round bf16 outputs a little differently, which flips so
 - seed 2024 (128 games): 1.23 [0.90, 1.69]
 - seed 2025 (256 games): 0.95 [0.76, 1.20]
 - pooled: **1.04 [0.87, 1.25]**
+
+## Longer training: `rl_v2` (ticket #8)
+
+`models/rl_v2.pt` is a fine-tune of `rl_v1`. It plays the same way (greedy 1-ply, with optional search), but it survives about 2.4× longer and scores 8% more per move.
+
+### What changed in training
+
+- **fp32 value head.** Under bf16 autocast the network's output V ≈ 110 is rounded to steps of 0.5, which with reward × 0.01 is 50 points. The median gap between the two best moves is only about 24 points, so the rounding changed the greedy move on **23.6%** of `rl_v1`'s states, and on 53% at reward × 0.003. The MLP head now runs in fp32 (`ValueNet.set_fp32_head`). That cuts the mean error of V from 12.8 to 3.2 points, for about 5% more inference time. Checkpoints saved without it, such as `rl_v1`, still run as they were trained. This is the likely reason why the fp32-head arms in the lookahead A/B above pointed in opposite directions.
+- **Longer horizon:** γ = 0.997 instead of 0.99. The reward scale is set to 1 − γ = 0.003, so V stays on the same scale, near the points per move. The search gate still had to move; see below.
+- **Restarts near deaths** (#10, technique 3). Every 50 steps all games are snapshotted. When a game ends in a game over, its snapshots from 50–500 moves before the end join a 65k-state pool, and half of all finished games restart from a random pool state.
+- **Schedule:** the learning rate warms up over 1M moves, then follows a cosine from 3e-4 to 3e-5. ε is fixed at 0.001.
+- **`best.pt` is selected on moves per game over**, not on the mean score, because the 20k-move cap saturates the mean.
+- **Resumable runs:** `--resume runs/<name>` continues from `resume.pt`, which is saved every 10 min. A snapshot goes to `ckpt/` at every eval.
+
+### Pilots (30M moves from `rl_v1` each; 256 games, seed `2025`, 20,000-move cap)
+
+| Arm | Game overs | Moves / game over | Death rate vs γ 0.99 | Points / move | Mean |
+|---|---:|---:|---|---:|---:|
+| `rl_v1` (no fine-tune) | 146 | 24,255 | | 108 | 1,497,820 |
+| A: γ 0.99 | 160 | 20,127 | 1.00 | 121 | 1,526,140 |
+| B: γ 0.997 | 139 | 25,825 | 0.78 [0.62, 0.98] | 114 | 1,595,842 |
+| **C: γ 0.997 + restarts** | **130** | **28,700** | **0.70 [0.56, 0.88]** | 113 | **1,643,864** |
+| D: γ 0.999 + restarts | 162 | 20,216 | 1.00 [0.80, 1.25] | 100 | 1,284,951 |
+
+- Fine-tuning at γ = 0.99 trades survival for points: the death rate rises and points per move rise. With a death worth only about 100 moves of reward, the agent takes more risk for bigger clears.
+- γ = 0.997 recovers survival. Restarts add a bit more, though C vs B alone is 0.90 [0.71, 1.14].
+- γ = 0.999 is worse on both counts. At reward × 0.001, immediate rewards are small next to the value error, and 30M moves are too few to learn a horizon of 1,000 moves.
+- The first attempt at B, with the bf16 head, got *worse* during training (training games fell from 7.4k to 5.7k moves). It was stopped, and the pilots were rerun with the fp32 head.
+
+### Long run `runs/v2` (arm C, 400M moves, 9.8 h, 12.5k moves/s)
+
+`uv run python -m block_puzzle_ai.train --init models/rl_v1.pt --out runs/v2 --total-moves 400000000 --gamma 0.997 --reward-scale 0.003 --restart-frac 0.5 --eps-start 0.001 --eval-minutes 45`
+
+Evals: 256 games, seed `2024`, 20,000-move cap.
+
+| Time | Moves | Game overs | Moves / game over | Points / move | Mean | Alive at cap |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0.8 h | 33M | 125 | 30,099 | 100 | 1,477,000 | 131/256 |
+| 1.7 h | 66M | 154 | 21,811 | 106 | 1,388,755 | 102/256 |
+| 2.5 h | 98M | 191 | 14,301 | 111 | 1,188,191 | 65/256 |
+| 3.3 h | 131M | 113 | 34,021 | 111 | 1,673,502 | 143/256 |
+| 4.1 h | 165M | 89 | 46,684 | 116 | 1,883,620 | 167/256 |
+| 5.0 h | 198M | 148 | 23,713 | 117 | 1,610,730 | 108/256 |
+| 5.8 h | 232M | 72 | **59,799** | 117 | 1,969,683 | 184/256 |
+| 6.6 h | 267M | 156 | 21,541 | 120 | 1,579,271 | 100/256 |
+| 7.5 h | 302M | 121 | 32,099 | 121 | 1,838,843 | 135/256 |
+| 8.3 h | 337M | 118 | 32,806 | 123 | 1,855,616 | 138/256 |
+| 9.1 h | 373M | 127 | 29,794 | 123 | 1,818,452 | 129/256 |
+| 9.8 h | 400M | 104 | 38,544 | 123 | 1,923,349 | 152/256 |
+
+- Evals swing a lot while the learning rate is high: from 14k to 60k moves per game over, and neighbouring evals differ by up to 2.8×.
+- Points per move climb throughout, from 100 to 123. Survival peaked at 232M moves, and the low-lr end of the run settled at 30–39k moves per game over. Late training drifts towards greedier play, as pilot A did.
+- `best.pt` is the 232M snapshot. On fresh seeds (`2025`) it held its lead over the final weights, so it was released as `rl_v2`:
+
+| Seed `2025`, 256 games, 20k cap | Game overs | Moves / game over | Death rate vs `rl_v1` | Points / move | Mean |
+|---|---:|---:|---|---:|---:|
+| `rl_v1` | 146 | 24,255 | 1.00 | 108 | 1,497,820 |
+| **`rl_v2` = `best.pt` (232M)** | **80** | **52,740** | **0.46 [0.35, 0.60]** | 117 | 1,930,164 |
+| final weights (400M) | 103 | 39,284 | 0.62 [0.48, 0.79] | 123 | 1,939,407 |
+
+### Long evaluation (the ticket's protocol: 64 games, seed `777`, 200,000-move cap)
+
+Commands:
+- `uv run python -m block_puzzle_ai.evaluate --agent models/rl_v2.pt --games 64 --seed 777 --max-moves 200000`
+- add `--search` for the search row. It uses the gate stored in the checkpoint; see below.
+
+| | Mean | Median | Min | Max | Moves / game over | Points / move | Alive at cap | Time |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `rl_v1` | 2,595,820 | 1,831,945 | 31,110 | 11,750,010 | 23,958 | 108 | 0 | 26 min |
+| `rl_v1` + search (gate 110) | 5,985,303 | 4,408,550 | 60,930 | 21,739,880 | 56,043 | 108 | 1 | 94 min |
+| **`rl_v2`** | **6,507,274** | **4,665,275** | 12,110 | 23,400,040 | **57,402** | **117** | 2 | 10 min |
+| `rl_v2` + search (gate 110) | 8,396,430 | 6,506,605 | 865,650 | 23,512,410 | 76,560 | 117 | 4 | 11 min |
+| **`rl_v2` + search (gate 115)** | **11,158,066** | **7,589,755** | 13,380 | 23,464,090 | **117,387** | 117 | **12** | 12 min |
+
+All search rows re-score the 8 best moves (`--top-k 8`, the default).
+
+The ticket's acceptance test is `rl_v2` vs `rl_v1`, both 1-ply: **mean +3.91M (2.5×), bootstrap 95% CI [+2.39M, +5.54M]**.
+- Without any search, `rl_v2` already matches `rl_v1` with search, and it plays about 9× faster. The faster evaluations are also helped by the #9 speed-ups.
+- With search at gate 115:
+  - +4.65M [+2.13M, +7.12M] over `rl_v2` alone; death rate 0.49 [0.34, 0.71]
+  - +5.17M [+2.81M, +7.49M] over `rl_v1` with search
+  - 4.3× `rl_v1`
+  - 12 of the 64 games were still alive at the cap, so this mean is a lower bound.
+  - It searched on 0.12% of moves, and the search changed the move on half of those.
+- The best game that ended in a real game over scored 22,892,280 points.
+- Re-scoring *all* moves instead of the top 8 (`--top-k 0`) scored 12,332,520 with 16 games at the cap, but it took about 26% more time per move. The difference is not significant: top 8 minus all moves is −1.17M [−4.05M, +1.64M], death rate 1.20 [0.81, 1.77].
+
+| Still alive after | 1k moves | 5k | 20k | 50k | 100k | 200k (cap) |
+|---|---:|---:|---:|---:|---:|---:|
+| `rl_v1` (of 64) | 63 | 56 | 28 | 6 | 1 | 0 |
+| `rl_v2` (of 64) | 63 | 58 | 48 | 28 | 10 | 2 |
+| `rl_v2` + search, gate 115 (of 64) | 63 | 63 | 56 | 41 | 25 | 12 |
+
+### 256 games played to the end (seed `2026`)
+
+The ticket asks for 256 games as well: the high score is the luckiest of n games, so it grows with n.
+
+Commands:
+- `uv run python -m block_puzzle_ai.evaluate --agent models/rl_v2.pt --games 256 --seed 2026 --max-moves 2000000`
+- `rl_v1` was run with `--max-moves 200000`, which none of its games reached.
+
+| | Mean | Median | Min | Max | Moves / game over | Points / move | Time |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `rl_v1` | 2,562,693 | 1,848,425 | 700 | 15,268,300 | 23,669 | 108 | 10 min |
+| **`rl_v2`** | **6,824,363** | **4,587,690** | 25,090 | **38,818,140** | **58,348** | **117** | 43 min* |
+
+\*The GPU was shared with another evaluation for most of this run.
+
+- **The mean rose 2.66×: +4.26M, bootstrap 95% CI [+3.36M, +5.19M].** All 256 games of both agents ended in a real game over.
+- **High score: 38,818,140 points** in 331,683 moves of plain 1-ply play.
+  - The "luckiest of n" estimate predicts about 42M: mean length × H₂₅₆ ≈ 58.3k × 6.1 ≈ 357k moves, at 117 points per move.
+
+| Still alive after | 1k moves | 5k | 20k | 50k | 100k | 200k | 300k |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `rl_v1` (of 256) | 246 | 211 | 109 | 33 | 4 | 0 | 0 |
+| `rl_v2` (of 256) | 248 | 231 | 176 | 110 | 53 | 11 | 1 |
+
+`rl_v2` score quantiles:
+
+| p10 | p25 | p50 | p75 | p90 |
+|---:|---:|---:|---:|---:|
+| 620k | 1.70M | 4.60M | 9.46M | 14.99M |
+
+### Lookahead search with `rl_v2`: the gate has to move
+
+`rl_v2`'s value function is much sharper than `rl_v1`'s. Over 8.6M moves (256 games, seed `4242`, `scripts/danger_trace.py`):
+
+| | Median best Q | 2nd percentile | Moves with Q < 110 | Moves with Q < 115 |
+|---|---:|---:|---:|---:|
+| `rl_v1` | 115 | 109.9 | 2% | |
+| `rl_v2` | 118.0 | 116.1 | 0.03% | 0.18% |
+
+Share of game overs flagged by each gate, by how many moves before the game over:
+
+| Gate | 1 move | 2 moves | 3 moves | 5 moves |
+|---|---:|---:|---:|---:|
+| `rl_v1`, Q < 110 | 97% | 66% | 42% | |
+| `rl_v2`, Q < 110 | 96% | 65% | 40% | 19% |
+| `rl_v2`, Q < 115 | 100% | 89% | 70% | 45% |
+
+So for `rl_v2`, the old gate of 110 still catches deaths 1–3 moves ahead about as often as before, but it fires 70× less often. A/B on fresh seeds (`2027`, 128 games, 200,000-move cap; `scripts/ab_lookahead.py 128 2027 200000 out.jsonl base,search-110-8,search-115-8 models/rl_v2.pt`):
+
+| Arm | Game overs | Moves / game over | Death rate vs 1-ply | Mean | Median | Searched moves |
+|---|---:|---:|---|---:|---:|---:|
+| `rl_v2`, 1-ply | 127 | 49,499 | 1.00 | 5,748,927 | 3,379,135 | |
+| search below 110, top 8 | 122 | 62,646 | 0.79 [0.62, 1.01] | 6,985,762 | 5,327,580 | 0.03% |
+| **search below 115, top 8** | **109** | **106,338** | **0.47 [0.36, 0.60]** | **10,594,480** | **8,695,410** | 0.12% |
+
+Gate 115 vs gate 110: 0.59 [0.46, 0.76]. The gate now lives in the checkpoint (`search_below`, 115 for `rl_v2`). Checkpoints without it, such as `rl_v1`, fall back to 110. `evaluate --search` and the viewer's "RL + lookahead" use the checkpoint's gate.

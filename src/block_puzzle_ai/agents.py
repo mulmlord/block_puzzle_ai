@@ -85,7 +85,10 @@ class LookaheadAgent(ValueAgent):
     In a state whose best 1-ply Q is below ``search_below``, each legal move m (or the ``top_k`` best)
     is re-scored as r(m) + gamma * E_x[max_m' q(m')]: the expectation over every piece x the game can
     spawn next, with the exact spawn probabilities, of the best 1-ply Q afterwards (0 = game over).
+    The right gate depends on the net's value scale; a checkpoint can carry its own as ``search_below``.
     """
+
+    DEFAULT_GATE = 110.0  # tuned for rl_v1 (docs/RESULTS.md); checkpoints without a "search_below" use it
 
     def __init__(
         self,
@@ -103,6 +106,15 @@ class LookaheadAgent(ValueAgent):
         self.chunk = chunk  # child states per network pass
         self.searched = 0  # states searched
         self.changed = 0  # of those, how often the search changed the move
+
+    @classmethod
+    def from_checkpoint(
+        cls, path: str | Path, device: str | torch.device = "cpu", search_below: float | None = None, **kwargs
+    ) -> LookaheadAgent:
+        """``search_below`` defaults to the checkpoint's own gate."""
+        net, ckpt = load_checkpoint(path, device)
+        gate = search_below if search_below is not None else ckpt.get("search_below", cls.DEFAULT_GATE)
+        return cls(net, ckpt["gamma"], ckpt["reward_scale"], name=Path(path).stem, search_below=gate, **kwargs)
 
     @torch.no_grad()
     def act(self, env: BatchGame, cand: Candidates) -> tuple[torch.Tensor, torch.Tensor]:
@@ -173,13 +185,18 @@ def choose_move(agent: Agent, game: Game, device: str | torch.device = "cpu") ->
 
 
 def make_agent(
-    spec: str, device: str | torch.device = "cpu", search_below: float | None = None, top_k: int | None = None
+    spec: str,
+    device: str | torch.device = "cpu",
+    search_below: float | None = None,
+    top_k: int | None = None,
+    search: bool = False,
 ) -> Agent:
-    """random | heuristic | checkpoint path; ``search_below`` turns a checkpoint into a LookaheadAgent."""
+    """random | heuristic | checkpoint path. ``search`` (with the checkpoint's gate) or ``search_below``
+    turns a checkpoint into a LookaheadAgent."""
     if spec == "random":
         return RandomAgent()
     if spec == "heuristic":
         return HeuristicAgent()
-    if search_below is not None:
+    if search or search_below is not None:
         return LookaheadAgent.from_checkpoint(spec, device, search_below=search_below, top_k=top_k)
     return ValueAgent.from_checkpoint(spec, device)

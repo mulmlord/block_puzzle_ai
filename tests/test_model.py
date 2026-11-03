@@ -73,3 +73,25 @@ def test_cuda_fit_maps_match_cpu(k):
     fits, counts = fit_maps(tables_for("cpu"), boards)
     cuda_fits, cuda_counts = fit_maps(tables_for("cuda"), boards.cuda())
     assert torch.equal(cuda_fits.cpu(), fits) and torch.equal(cuda_counts.cpu(), counts)
+
+
+@cuda
+def test_fp32_head_removes_most_bf16_output_rounding():
+    bf16 = load_checkpoint("models/rl_v1.pt", "cuda")[0]
+    fp32 = load_checkpoint("models/rl_v1.pt", "cuda")[0]
+    fp32.set_fp32_head(True)
+    planes, globals_ = inputs(bf16, 4096, seed=4)
+    with torch.no_grad():
+        ref = bf16(planes, globals_)  # no autocast: all fp32
+    err_bf16 = (bf16.predict(planes, globals_) - ref).abs().mean()
+    err_fp32 = (fp32.predict(planes, globals_) - ref).abs().mean()
+    assert err_fp32 < 0.5 * err_bf16
+
+
+def test_fp32_head_is_saved_and_old_checkpoints_load_without_it(tmp_path):
+    from block_puzzle_ai.model import save_checkpoint
+
+    assert not load_checkpoint("models/rl_v1.pt")[0].fp32_head
+    net = ValueNet(n_globals=5, channels=4, blocks=1, hidden=8, fp32_head=True)
+    save_checkpoint(tmp_path / "net.pt", net, gamma=0.99, reward_scale=0.01)
+    assert load_checkpoint(tmp_path / "net.pt")[0].fp32_head

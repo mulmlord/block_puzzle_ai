@@ -16,6 +16,8 @@ from block_puzzle_ai.game import N, Game, Move, placements
 from block_puzzle_ai.pieces import HARD_GROUPS, all_pieces, load_piece_table
 
 CELLS = N * N
+# per-game tensors that make up a BatchGame's state
+STATE = ("board", "pending", "score", "moves", "lines_cleared", "history")
 # pending order after removing a slot: the other two keep their order, the new piece goes last
 REMAINING = torch.tensor([[1, 2], [0, 2], [0, 1]])
 
@@ -161,9 +163,17 @@ class BatchGame:
 
     def keep(self, idx: torch.Tensor) -> None:
         """Drop every game not in ``idx`` (used by evaluation to stop simulating finished games)."""
-        for name in ("board", "pending", "score", "moves", "lines_cleared", "history"):
+        for name in STATE:
             setattr(self, name, getattr(self, name)[idx])
         self.n = len(self.board)
+
+    def state(self) -> dict[str, torch.Tensor]:
+        return {name: getattr(self, name) for name in STATE}
+
+    def set_state(self, idx: torch.Tensor, state: dict[str, torch.Tensor]) -> None:
+        """Put games ``idx`` into the given states (one row of each ``state`` tensor per index)."""
+        for name in STATE:
+            getattr(self, name)[idx] = state[name]
 
     @classmethod
     def from_state(

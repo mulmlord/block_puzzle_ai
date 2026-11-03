@@ -1,4 +1,7 @@
-"""Record rl_v1's best Q per move and find out how well it flags the moves before a game over."""
+"""Record a checkpoint's best Q per move and find out how well it flags the moves before a game over.
+
+danger_trace.py GAMES CAP OUT.npz [CHECKPOINT (default models/rl_v1.pt)]
+"""
 import sys
 import time
 
@@ -11,7 +14,7 @@ from block_puzzle_ai.features import best_per_env
 
 dev = "cuda"
 n_games, cap = int(sys.argv[1]), int(sys.argv[2])
-agent = ValueAgent.from_checkpoint("models/rl_v1.pt", dev)
+agent = ValueAgent.from_checkpoint(sys.argv[4] if len(sys.argv) > 4 else "models/rl_v1.pt", dev)
 env = BatchGame(n_games, dev, seed=4242)
 ids = torch.arange(n_games, device=dev)
 traces = [[] for _ in range(n_games)]
