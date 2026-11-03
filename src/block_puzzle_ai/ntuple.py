@@ -200,6 +200,8 @@ def train(args: argparse.Namespace) -> None:
         if args.gamma is not None:
             base["gamma"] = args.gamma
         cfg = NTupleConfig(**(base | overrides))
+        if args.alpha is None:  # lock-free updates diverge once alpha * threads exceeds ~1 (docs/RESULTS.md)
+            cfg.alpha = min(0.1, 0.5 / cfg.threads)
         model = make_model(shapes_to_tuples(cfg.shapes))
         moves, elapsed0 = 0, 0.0
     tuples = [list(t) for t in model.tuples]
@@ -284,7 +286,7 @@ def main(argv: list[str] | None = None) -> None:
     t.add_argument("--resume", action="store_true", help="continue from OUT/latest.ntw")
     t.add_argument("--shapes", help="comma-separated tuple shapes (default window4,line)")
     t.add_argument("--gamma", type=float)
-    t.add_argument("--alpha", type=float)
+    t.add_argument("--alpha", type=float, help="TD step size (default min(0.1, 0.5 / threads))")
     t.add_argument("--restart-frac", type=float)
     t.add_argument("--threads", type=int)
     t.add_argument("--seed", type=int)

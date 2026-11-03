@@ -11,7 +11,10 @@
 #include <atomic>
 #include <bit>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
+#include <exception>
+#include <mutex>
 #include <limits>
 #include <stdexcept>
 #include <thread>
@@ -195,7 +198,8 @@ struct Choice {
 };
 
 // Greedy 1-ply move: argmax over legal moves of points + gamma * V(after-state), first maximum in engine
-// order (slot-major, position ascending). Returns false if the state has no legal move.
+// order (slot-major, position ascending). Returns false only if the state has no legal move; with
+// non-finite values it still returns a legal move, and callers check std::isfinite(out.q).
 inline bool best_move(const NTuple& nt, const State& s, float gamma, Choice& out) {
     const Tables& t = nt.tables();
     Afterstate a;
@@ -210,10 +214,37 @@ inline bool best_move(const NTuple& nt, const State& s, float gamma, Choice& out
             const Placed p = apply(t, s.board, piece, pos);
             a.board = p.board;
             const double q = p.points + gamma * nt.value(a);
-            if (q > best) best = q, found = true, out = {slot, pos, p.points, a, q};
+            if (!found || q > best) best = q, found = true, out = {slot, pos, p.points, a, q};
         });
     }
     return found;
+}
+
+// Runs f(i) for i in [0, n) on n threads; the first exception thrown by any thread is rethrown after all join,
+// so a failing worker raises in Python instead of calling std::terminate.
+template <class F>
+inline void parallel(int n, F&& f) {
+    std::exception_ptr error;
+    std::mutex m;
+    {
+        std::vector<std::jthread> pool;
+        for (int i = 0; i < n; i++) {
+            pool.emplace_back([&, i] {
+                try {
+                    f(i);
+                } catch (...) {
+                    std::lock_guard lock(m);
+                    if (!error) error = std::current_exception();
+                }
+            });
+        }
+    }
+    if (error) std::rethrow_exception(error);
+}
+
+inline void check_finite(double q) {
+    if (!std::isfinite(q))
+        throw std::runtime_error("n-tuple values diverged (non-finite value); lower alpha or use fewer threads");
 }
 
 // Per-thread seeds: the (i + 1)-th output of a splitmix64 stream started at ``seed``.
@@ -254,11 +285,7 @@ public:
         const auto n = static_cast<uint64_t>(workers_.size());
         std::vector<TrainStats> per(n);
         const auto start = std::chrono::steady_clock::now();
-        {
-            std::vector<std::jthread> pool;
-            for (uint64_t i = 0; i < n; i++)
-                pool.emplace_back([&, i] { per[i] = work(workers_[i], moves / n + (i < moves % n)); });
-        }
+        parallel(static_cast<int>(n), [&](int i) { per[i] = work(workers_[i], moves / n + (i < moves % n)); });
         TrainStats total;
         total.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
         for (const TrainStats& st : per) {
@@ -310,6 +337,7 @@ private:
             w.fresh = true;
             best_move(nt_, w.s, gamma_, w.choice);  // an empty board always fits a piece
         }
+        check_finite(w.choice.q);
     }
 
     void game_over(Worker& w, TrainStats& st) {
@@ -332,6 +360,7 @@ private:
             step(t, w.s, w.choice.slot, w.choice.pos, w.rng);
             Choice next;
             if (best_move(nt_, w.s, gamma_, next)) {
+                check_finite(next.q);
                 if (w.steps++ % SNAPSHOT_EVERY == 0) {  // only states with a legal move may become restart states
                     w.ring[w.ring_head] = {w.s, w.game};
                     w.ring_head = (w.ring_head + 1) % RING;
@@ -364,10 +393,7 @@ inline std::vector<GameOutcome> evaluate(const NTuple& nt, int games, uint64_t s
     const std::vector<uint64_t> seeds = stream_seeds(seed, games);
     std::vector<GameOutcome> out(games);
     std::atomic<int> next{0};
-    {
-        std::vector<std::jthread> pool;
-        for (int i = 0; i < threads; i++) {
-            pool.emplace_back([&] {
+    parallel(threads, [&](int) {
                 for (int g; (g = next.fetch_add(1)) < games;) {
                     Xoshiro256 rng(seeds[g]);
                     State s;
@@ -375,6 +401,7 @@ inline std::vector<GameOutcome> evaluate(const NTuple& nt, int games, uint64_t s
                     Choice c;
                     bool truncated = false;
                     while (best_move(nt, s, gamma, c)) {
+                        check_finite(c.q);
                         if (s.moves >= max_moves) {
                             truncated = true;
                             break;
@@ -383,9 +410,7 @@ inline std::vector<GameOutcome> evaluate(const NTuple& nt, int games, uint64_t s
                     }
                     out[g] = {s.score, s.moves, s.lines, truncated};
                 }
-            });
-        }
-    }
+    });
     return out;
 }
 

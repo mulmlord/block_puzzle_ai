@@ -281,3 +281,22 @@ def test_interrupt_saves_latest(tmp_path):
     proc.send_signal(signal.SIGINT)
     assert proc.wait(timeout=30) == 0
     assert load_checkpoint(tmp_path / "latest.ntw")[3]["moves_trained"] > 0
+
+
+def test_divergence_raises_instead_of_crashing():
+    """Non-finite values must stop training and evaluation with an error, not abort the process."""
+    model = make_model(shapes_to_tuples(["line"]))
+    model.weights[:] = np.nan
+    with pytest.raises(RuntimeError, match="diverged"):
+        _engine.Trainer(model, 1.0, 0.1, 0.5, 2, 0).run(1000)
+    with pytest.raises(RuntimeError, match="diverged"):
+        nt_evaluate(model, 4, 0, 100, 2)
+
+
+def test_default_alpha_scales_with_threads(tmp_path):
+    """Lock-free updates stay stable while alpha * threads <= 0.5, so the default alpha is min(0.1, 0.5 / threads)."""
+    for threads, alpha in ((2, 0.1), (10, 0.05)):
+        out = tmp_path / str(threads)
+        main(["train", "--out", str(out), "--total-moves", "20000", "--threads", str(threads), "--shapes", "line",
+              "--eval-games", "2", "--eval-max-moves", "100"])  # fmt: skip
+        assert load_checkpoint(out / "latest.ntw")[0].alpha == pytest.approx(alpha)
