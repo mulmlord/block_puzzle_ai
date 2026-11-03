@@ -17,3 +17,6 @@ checkpoints/
 wandb/
 
 .claude/
+
+# C++ build trees (scikit-build-core / CMake)
+build/

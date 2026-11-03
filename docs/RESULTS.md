@@ -296,3 +296,62 @@ So for `rl_v2`, the old gate of 110 still catches deaths 1–3 moves ahead about
 | **search below 115, top 8** | **109** | **106,338** | **0.47 [0.36, 0.60]** | **10,594,480** | **8,695,410** | 0.12% |
 
 Gate 115 vs gate 110: 0.59 [0.46, 0.76]. The gate now lives in the checkpoint (`search_below`, 115 for `rl_v2`). Checkpoints without it, such as `rl_v1`, fall back to 110. `evaluate --search` and the viewer's "RL + lookahead" use the checkpoint's gate.
+
+### Where `rl_v2` + search still dies (ticket #10)
+
+The question was whether the remaining game overs could be prevented by more search, or only by a better value function.
+
+- **Method:**
+  - Play 64 games with `rl_v2` and gate-115 search (seed `4243`, 200,000-move cap), which gave 50 game overs.
+  - Keep the state 1, 3, 10 and 30 moves before each game over.
+  - Replay each state 16 times with freshly drawn pieces (the three pending pieces are kept), and count how often the agent is still alive 100 moves later.
+  - Compare three policies: plain 1-ply, gate 115, and search on every move for the first 40 moves.
+- The script was a one-off and is not in the repo.
+
+| Moves before the game over | 1-ply | Gate 115 | Search on every move | Gate fired (Q < 115) | Median best Q |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 0.66 | 0.67 | 0.69 | 98% | 80.7 |
+| 3 | 0.90 | 0.93 | 0.94 | 48% | 115.1 |
+| 10 | 0.996 | 0.999 | 0.999 | 2% | 117.3 |
+| 30 | 0.999 | 0.999 | 0.999 | 0% | 118.3 |
+
+- **No position was lost.** Even 1 move before a game over, two thirds of fresh draws survive the next 100 moves, and none of the 200 states died on all 16 replays. These games ended because of the particular pieces that came next.
+- **Ten moves out, the positions are ordinary.** Their survival matches that of a typical position (about 0.999 per 100 moves at 117k moves per game over). Their median Q is 117.3, against 118 overall. The danger builds up only over the last ~3 moves, where the gate already fires.
+- **More search has little left to gain.** Searching every move instead of gating:
+  - 1 move before: +0.02 [−0.01, +0.06] survival (bootstrap 95% CI over states)
+  - 3 moves before: +0.01 [−0.01, +0.04]
+  - It cost 44× the compute.
+- **Consequences:**
+  - Distilling the search into training is dropped. At gate 115 the search costs only about 20% more time, and it acts only in the last few moves, where the net already senses danger.
+  - What remains is the per-move risk of ordinary positions, which is a training problem, not a search problem.
+
+## C++ engine (ticket #11)
+
+`block_puzzle_ai._engine` (sources in `cpp/`, Python wrapper `block_puzzle_ai.engine`) is a single-game bitboard twin of `game.py`, meant for CPU-heavy work: the n-tuple value functions of #10 technique 7, and search.
+- The board is an `unsigned __int128`.
+- Each piece's legal positions come from one mask expression over its ≤ 9 cells.
+- Full rows and columns come from the 10 row fields.
+- The spawn RNG is an exact port of `randTiles`, and a bit-exact port of CPython's `random.Random` lets C++ games replay `game.Game(seed)` games.
+- `uv sync` builds it with scikit-build-core and nanobind.
+
+**Parity** (`tests/test_engine.py`):
+- 1,000 seeded games, two each (so the spawn history carries over the reset), stepped in lock-step with `game.py`. The legal moves, board, pieces, score, points, lines and game over were identical at every move.
+- Every legal move on 1,000 random boards filled from 30% to 90%, including clears of 3+ lines at once.
+- Spawns and the exact spawn distribution at scores around each threshold, and at scores where float32 rounding matters.
+- The RNG for seeds up to 2⁶⁴ − 1.
+
+**Throughput** (`uv run python scripts/bench_engine.py`, AMD Ryzen 7 7840HX with 12 cores / 24 threads, RTX 4070 Laptop GPU):
+
+| Simulator | Moves/s | Note |
+|---|---:|---|
+| C++ `random_play`, 1 thread | 9.8M | 24.2 moves per game, like the random baseline |
+| C++ `random_play`, 12 threads | 84.6M | |
+| C++ `random_play`, 24 threads | **107.3M** | |
+| C++ `afterstate_play`, 1 thread | 0.75M | 57M after-states/s |
+| C++ `afterstate_play`, 24 threads | 7.9M | 603M after-states/s |
+| `game.py`, 1 thread | 20.9k | |
+| `BatchGame` on CUDA, 4,096 games, random agent | 135k | |
+
+- **Random play:** the targets were ≥ 1M moves/s on one thread and ≥ 10M on all threads. Both are beaten about 10×.
+- **After-state play** applies every legal move before each move (about 76 per move), which is the per-move work of a 1-ply learner before any value lookups. This sets the ceiling for CPU n-tuple training on this machine: about 8M moves/s, against the GPU trainer's 12.5k moves/s.
+- 12 → 24 threads adds only 27%: the second hyper-thread of each core shares its execution units.
