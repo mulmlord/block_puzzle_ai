@@ -161,6 +161,25 @@ NB_MODULE(_engine, m) {
         .def_prop_ro("done", &Game::done);
 
     m.def(
+        "random_play",
+        [](const Tables& t, int threads, uint64_t moves_per_thread, uint64_t seed) {
+            const bpa::PlayStats st = bpa::play_random(t, threads, moves_per_thread, seed, false);
+            return std::make_tuple(st.moves, st.games, st.seconds);
+        },
+        nb::arg("tables"), nb::arg("threads"), nb::arg("moves_per_thread"), nb::arg("seed"),
+        nb::call_guard<nb::gil_scoped_release>(), "uniformly random play on N threads -> (moves, games, seconds)");
+
+    m.def(
+        "afterstate_play",
+        [](const Tables& t, int threads, uint64_t moves_per_thread, uint64_t seed) {
+            const bpa::PlayStats st = bpa::play_random(t, threads, moves_per_thread, seed, true);
+            return std::make_tuple(st.moves, st.games, st.afterstates, st.seconds);
+        },
+        nb::arg("tables"), nb::arg("threads"), nb::arg("moves_per_thread"), nb::arg("seed"),
+        nb::call_guard<nb::gil_scoped_release>(),
+        "random play that also applies every legal move first -> (moves, games, afterstates, seconds)");
+
+    m.def(
         "spawn_sequence",
         [](const Tables& t, uint64_t seed, int64_t score, const std::vector<int>& history, int n) {
             int h[3];

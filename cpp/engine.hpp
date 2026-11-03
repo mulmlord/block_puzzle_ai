@@ -7,9 +7,17 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cstdint>
 #include <stdexcept>
+#include <thread>
 #include <vector>
+
+#ifdef __BMI2__
+#include <immintrin.h>
+#endif
+
+#include "rng.hpp"
 
 namespace bpa {
 
@@ -202,6 +210,88 @@ Placed step(const Tables& t, State& s, int slot, int pos, Rng& rng) {
     s.moves++;
     s.lines += a.lines;
     return a;
+}
+
+// ---- random play (benchmark and smoke test) ---------------------------------------------------
+
+struct PlayStats {
+    uint64_t moves = 0, games = 0, afterstates = 0;
+    double seconds = 0;
+    uint64_t checksum = 0;  // sum of after-state points, so the work cannot be optimized away
+};
+
+// Position of the k-th (0-based) set bit of a 64-bit word.
+inline int select_bit(uint64_t word, uint32_t k) {
+#ifdef __BMI2__
+    return std::countr_zero(_pdep_u64(uint64_t{1} << k, word));
+#else
+    for (; k; k--) word &= word - 1;
+    return std::countr_zero(word);
+#endif
+}
+
+// Uniform random legal (slot, pos) of a state that has one.
+template <class Rng>
+inline void random_move(const Tables& t, const State& s, Rng& rng, int& slot, int& pos) {
+    Board legal[3];
+    int count[3], total = 0;
+    for (int i = 0; i < 3; i++) {
+        legal[i] = legal_positions(t, s.board, s.pending[i]);
+        count[i] = std::popcount(static_cast<uint64_t>(legal[i])) + std::popcount(static_cast<uint64_t>(legal[i] >> 64));
+        total += count[i];
+    }
+    uint32_t k = rng.randrange(static_cast<uint32_t>(total));
+    for (slot = 0; k >= static_cast<uint32_t>(count[slot]); slot++) k -= count[slot];
+    const auto lo = static_cast<uint64_t>(legal[slot]);
+    const int n_lo = std::popcount(lo);
+    pos = static_cast<int>(k) < n_lo ? select_bit(lo, k) : 64 + select_bit(static_cast<uint64_t>(legal[slot] >> 64), k - n_lo);
+}
+
+// Each thread plays exactly moves_per_thread uniformly random moves with its own Xoshiro256,
+// restarting games that end. With ``afterstates`` it first applies every legal move, as a 1-ply learner would.
+inline PlayStats play_random(const Tables& t, int threads, uint64_t moves_per_thread, uint64_t seed, bool afterstates) {
+    if (threads < 1) throw std::invalid_argument("threads must be >= 1");
+    std::vector<PlayStats> per_thread(threads);
+    const auto start = std::chrono::steady_clock::now();
+    {
+        std::vector<std::jthread> pool;
+        for (int i = 0; i < threads; i++) {
+            pool.emplace_back([&, i] {
+                uint64_t x = seed + static_cast<uint64_t>(i);
+                Xoshiro256 rng(splitmix64(x));
+                PlayStats st;
+                State s;
+                reset(t, s, rng);
+                st.games = 1;
+                for (uint64_t m = 0; m < moves_per_thread; m++) {
+                    while (!has_legal_move(t, s)) reset(t, s, rng), st.games++;
+                    if (afterstates) {
+                        for (int slot = 0; slot < 3; slot++) {
+                            const int piece = s.pending[slot];
+                            for_each_bit(legal_positions(t, s.board, piece), [&](int pos) {
+                                st.checksum += apply(t, s.board, piece, pos).points;
+                                st.afterstates++;
+                            });
+                        }
+                    }
+                    int slot, pos;
+                    random_move(t, s, rng, slot, pos);
+                    step(t, s, slot, pos, rng);
+                }
+                st.moves = moves_per_thread;
+                per_thread[i] = st;
+            });
+        }
+    }
+    PlayStats total;
+    total.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    for (const PlayStats& st : per_thread) {
+        total.moves += st.moves;
+        total.games += st.games;
+        total.afterstates += st.afterstates;
+        total.checksum += st.checksum;
+    }
+    return total;
 }
 
 }  // namespace bpa

@@ -34,6 +34,18 @@ def spawn_sequence(seed: int, score: int, history: Sequence[int], n: int, table:
     return _engine.spawn_sequence(cpp_tables(table), seed, score, _history3(history), n)
 
 
+def random_play(threads: int, moves_per_thread: int, seed: int = 0, table: str = "new") -> tuple[int, int, float]:
+    """Uniformly random play on ``threads`` threads (fast RNG, GIL released) -> (moves, games, seconds)."""
+    return _engine.random_play(cpp_tables(table), threads, moves_per_thread, seed)
+
+
+def afterstate_play(
+    threads: int, moves_per_thread: int, seed: int = 0, table: str = "new"
+) -> tuple[int, int, int, float]:
+    """random_play that applies every legal move before each move -> (moves, games, afterstates, seconds)."""
+    return _engine.afterstate_play(cpp_tables(table), threads, moves_per_thread, seed)
+
+
 class CppGame:
     """game.Game-like view of one C++ game. Boards are 100-bit ints and pieces are pieces.Piece."""
 

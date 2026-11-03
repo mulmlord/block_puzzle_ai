@@ -8,7 +8,7 @@ import torch
 from block_puzzle_ai import _engine
 from block_puzzle_ai.batch_env import spawn_distribution as torch_spawn_distribution
 from block_puzzle_ai.batch_env import tables_for
-from block_puzzle_ai.engine import CppGame, cpp_tables, spawn_sequence
+from block_puzzle_ai.engine import CppGame, afterstate_play, cpp_tables, random_play, spawn_sequence
 from block_puzzle_ai.game import Game, Move, PieceGenerator, clear_full_lines, placements, points_for
 from block_puzzle_ai.pieces import all_pieces, load_piece_table
 
@@ -161,3 +161,17 @@ def test_fast_rng_game_is_deterministic():
         move = pick.choice(a.legal_moves())
         assert a.step(move) == b.step(move)
     assert a.board == b.board and a.moves > 0
+
+
+def test_random_play_counts_and_determinism():
+    moves, games, seconds = random_play(2, 10_000, seed=1)
+    assert moves == 20_000 and games >= 2 and seconds > 0
+    assert random_play(2, 10_000, seed=1)[:2] == (moves, games)
+    moves, games, after, _ = afterstate_play(2, 10_000, seed=1)
+    assert moves == 20_000 and after > moves
+
+
+def test_random_play_edge_counts():
+    with pytest.raises(ValueError):
+        random_play(0, 100)
+    assert random_play(3, 0)[:2] == (0, 3)
