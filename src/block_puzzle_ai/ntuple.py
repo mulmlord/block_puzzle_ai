@@ -12,6 +12,7 @@ from collections.abc import Sequence
 
 from block_puzzle_ai import _engine
 from block_puzzle_ai.engine import cpp_tables
+from block_puzzle_ai.evaluate import GameResult
 from block_puzzle_ai.game import N
 from block_puzzle_ai.pieces import all_pieces
 
@@ -98,3 +99,10 @@ def make_model(tuples: list[list[int]], table: str = "new") -> _engine.NTuple:
 def value(model: _engine.NTuple, board: int, remaining: Sequence[int], cooldown: bool) -> float:
     """V of an after-state: a 100-bit board, the 2 remaining piece ids and the cooldown flag."""
     return model.value(board & _LOW64, board >> 64, list(remaining), cooldown)
+
+
+def evaluate(
+    model: _engine.NTuple, games: int, seed: int, max_moves: int, threads: int, gamma: float = 1.0
+) -> list[GameResult]:
+    """Greedy 1-ply games on ``threads`` threads; results are in game order and independent of the thread count."""
+    return [GameResult(*r) for r in _engine.evaluate_ntuple(model, games, seed, max_moves, threads, gamma)]

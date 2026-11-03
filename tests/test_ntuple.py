@@ -8,6 +8,7 @@ import pytest
 from block_puzzle_ai import _engine
 from block_puzzle_ai.engine import CppGame, cpp_tables
 from block_puzzle_ai.game import placements
+from block_puzzle_ai.ntuple import evaluate as nt_evaluate
 from block_puzzle_ai.ntuple import (
     fit_bucket,
     make_model,
@@ -158,3 +159,50 @@ def test_update_precision_at_large_values():
     before = value(model, board, rem, False)
     model.update(0, 0, rem, False, before + 1000.0, 0.1)
     assert value(model, board, rem, False) - before >= 50.0  # nominal step: 0.1 * 1000 = 100
+
+
+def test_evaluate_deterministic_across_threads(random_model):
+    _, model = random_model
+    model.weights[:] *= 0.01
+    one = nt_evaluate(model, games=16, seed=3, max_moves=2000, threads=1)
+    assert nt_evaluate(model, games=16, seed=3, max_moves=2000, threads=4) == one
+    assert len(one) == 16 and all(r.moves > 0 for r in one)
+
+
+def test_evaluate_zero_cap(random_model):
+    _, model = random_model
+    assert all(r.truncated and r.moves == 0 and r.score == 0 for r in nt_evaluate(model, 8, 1, 0, 2))
+
+
+def test_trainer_chunks_equal_one_run():
+    tuples = shapes_to_tuples(["line"])
+    a, b = make_model(tuples), make_model(tuples)
+    ta, tb = _engine.Trainer(a, 1.0, 0.1, 0.5, 1, 7), _engine.Trainer(b, 1.0, 0.1, 0.5, 1, 7)
+    ta.run(3000)
+    ta.run(3000)
+    tb.run(6000)
+    assert np.array_equal(a.weights, b.weights)
+
+
+def test_training_improves():
+    model = make_model(shapes_to_tuples(["window4", "line"]))
+    stats = _engine.Trainer(model, 1.0, 0.1, 0.5, 4, 0).run(3_000_000)
+    assert stats["moves"] == 3_000_000 and stats["games"] > 0
+    results = nt_evaluate(model, games=64, seed=777, max_moves=100_000, threads=4)
+    assert sum(r.moves for r in results) / 64 > 150  # random play: 24, tuned heuristic: 279
+
+
+def test_trainer_and_evaluate_reject_zero_threads(random_model):
+    _, model = random_model
+    with pytest.raises(ValueError):
+        _engine.Trainer(model, 1.0, 0.1, 0.5, 0, 0)
+    with pytest.raises(ValueError):
+        nt_evaluate(model, 4, 0, 100, 0)
+
+
+def test_trainer_restarts_from_pool():
+    """restart_frac 1: every game after the first restarts from a pool state, which must be playable."""
+    for seed in range(10):  # small early pools: a game over snapshotted into the pool gets drawn quickly
+        model = make_model(shapes_to_tuples(["line"]))
+        stats = _engine.Trainer(model, 1.0, 0.1, 1.0, 1, seed).run(5_000)
+        assert stats["games"] > 10 and stats["restarts"] >= stats["games"] - 1

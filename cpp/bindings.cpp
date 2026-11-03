@@ -199,6 +199,41 @@ NB_MODULE(_engine, m) {
             nb::arg("board_lo"), nb::arg("board_hi"), nb::arg("remaining"), nb::arg("cooldown"), nb::arg("target"),
             nb::arg("alpha"), "TD step: each looked-up weight += alpha * (target - V) / n_lookups");
 
+    nb::class_<bpa::Trainer>(m, "Trainer", "lock-free multithreaded TD(0) self-play with restarts near game overs")
+        .def(nb::init<bpa::NTuple&, float, float, double, int, uint64_t>(), nb::arg("ntuple"), nb::arg("gamma"),
+             nb::arg("alpha"), nb::arg("restart_frac"), nb::arg("threads"), nb::arg("seed"), nb::keep_alive<1, 2>())
+        .def_rw("alpha", &bpa::Trainer::alpha)
+        .def(
+            "run",
+            [](bpa::Trainer& tr, uint64_t moves) {
+                bpa::TrainStats st;
+                {
+                    nb::gil_scoped_release release;
+                    st = tr.run(moves);
+                }
+                nb::dict d;
+                d["moves"] = st.moves, d["seconds"] = st.seconds, d["games"] = st.games, d["deaths"] = st.deaths;
+                d["fresh_games"] = st.fresh_games, d["mean_score"] = st.mean_score(), d["mean_moves"] = st.mean_moves();
+                d["restarts"] = st.restarts, d["value_mean"] = st.value_mean();
+                return d;
+            },
+            nb::arg("moves"), "play this many moves in total across the threads, learning as it goes");
+
+    m.def(
+        "evaluate_ntuple",
+        [](const bpa::NTuple& nt, int games, uint64_t seed, int64_t max_moves, int threads, float gamma) {
+            std::vector<bpa::GameOutcome> res;
+            {
+                nb::gil_scoped_release release;
+                res = bpa::evaluate(nt, games, seed, max_moves, threads, gamma);
+            }
+            std::vector<std::tuple<int64_t, int64_t, int64_t, bool>> out;
+            for (const auto& r : res) out.emplace_back(r.score, r.moves, r.lines, r.truncated);
+            return out;
+        },
+        nb::arg("ntuple"), nb::arg("games"), nb::arg("seed"), nb::arg("max_moves"), nb::arg("threads"),
+        nb::arg("gamma") = 1.0f, "greedy 1-ply games -> (score, moves, lines, truncated) per game, in game order");
+
     m.def(
         "random_play",
         [](const Tables& t, int threads, uint64_t moves_per_thread, uint64_t seed) {
