@@ -1,6 +1,11 @@
 """Tests of the n-tuple value function, trainer and CLI (block_puzzle_ai.ntuple, cpp/ntuple.hpp)."""
 
+import json
 import random
+import signal
+import subprocess
+import sys
+import time
 
 import numpy as np
 import pytest
@@ -10,8 +15,13 @@ from block_puzzle_ai.engine import CppGame, cpp_tables
 from block_puzzle_ai.game import placements
 from block_puzzle_ai.ntuple import evaluate as nt_evaluate
 from block_puzzle_ai.ntuple import (
+    NTupleConfig,
     fit_bucket,
+    load_checkpoint,
+    load_model,
+    main,
     make_model,
+    save_checkpoint,
     shape_cells,
     shapes_to_tuples,
     transform_board,
@@ -206,3 +216,68 @@ def test_trainer_restarts_from_pool():
         model = make_model(shapes_to_tuples(["line"]))
         stats = _engine.Trainer(model, 1.0, 0.1, 1.0, 1, seed).run(5_000)
         assert stats["games"] > 10 and stats["restarts"] >= stats["games"] - 1
+
+
+def test_checkpoint_roundtrip(tmp_path, random_model):
+    tuples, model = random_model
+    cfg = NTupleConfig(alpha=0.05)
+    save_checkpoint(tmp_path / "m.ntw", cfg, tuples, model.weights, 1234, 5.5)
+    loaded, cfg2, meta = load_model(tmp_path / "m.ntw")
+    assert cfg2 == cfg and meta == {"moves_trained": 1234, "elapsed_min": 5.5}
+    assert np.array_equal(loaded.weights, model.weights)
+    for board, rem, cd in sample_afterstates(10, 5):
+        assert value(loaded, board, rem, cd) == value(model, board, rem, cd)
+
+
+def test_checkpoint_rejects_corruption(tmp_path, random_model):
+    tuples, model = random_model
+    path = tmp_path / "m.ntw"
+    save_checkpoint(path, NTupleConfig(), tuples, model.weights, 0, 0.0)
+    raw = path.read_bytes()
+    (tmp_path / "magic.ntw").write_bytes(b"XXXXXXXX" + raw[8:])
+    (tmp_path / "short.ntw").write_bytes(raw[:-4])
+    for bad in ("magic.ntw", "short.ntw"):
+        with pytest.raises(ValueError):
+            load_checkpoint(tmp_path / bad)
+
+
+def train_args(out, moves):
+    return ["train", "--out", str(out), "--total-moves", str(moves), "--threads", "2", "--shapes", "line",
+            "--eval-minutes", "0", "--eval-games", "8", "--eval-max-moves", "2000", "--chunk-seconds", "1"]  # fmt: skip
+
+
+def test_train_resume_and_evaluate_cli(tmp_path, capsys):
+    main(train_args(tmp_path, 100_000))
+    main(train_args(tmp_path, 200_000) + ["--resume", "--alpha", "0.05"])
+    cfg, _, _, meta = load_checkpoint(tmp_path / "latest.ntw")
+    assert meta["moves_trained"] >= 200_000 and cfg.alpha == 0.05
+    records = [json.loads(line) for line in (tmp_path / "metrics.jsonl").read_text().splitlines()]
+    evals = [r for r in records if r["type"] == "eval"]
+    keys = {"eval_mean", "eval_median", "eval_max", "eval_moves_per_death", "elapsed_min", "moves"}
+    assert evals and keys <= evals[0].keys()
+    assert any(r["type"] == "train" and r["moves_per_s"] > 0 for r in records)
+    capsys.readouterr()
+    main(["evaluate", "--weights", str(tmp_path / "best.ntw"), "--games", "4", "--seed", "1", "--max-moves", "500",
+          "--threads", "2", "--json"])  # fmt: skip
+    out = json.loads(capsys.readouterr().out)
+    assert out["games"] == 4 and len(out["results"]) == 4
+
+
+def test_resume_keeps_best(tmp_path):
+    main(train_args(tmp_path, 100_000))
+    lines = (tmp_path / "metrics.jsonl").read_text().splitlines()
+    best = max(json.loads(line).get("best_eval_moves_per_death", 0) for line in lines)
+    best_bytes = (tmp_path / "best.ntw").read_bytes()
+    record = json.dumps({"type": "eval", "best_eval_moves_per_death": best * 1e6})
+    (tmp_path / "metrics.jsonl").write_text("\n".join(lines) + "\n" + record + "\n")
+    main(train_args(tmp_path, 200_000) + ["--resume"])
+    assert (tmp_path / "best.ntw").read_bytes() == best_bytes  # nothing beat the recorded best
+
+
+def test_interrupt_saves_latest(tmp_path):
+    proc = subprocess.Popen([sys.executable, "-m", "block_puzzle_ai.ntuple", "train", "--out", str(tmp_path), "--hours",
+                             "1", "--threads", "1", "--shapes", "line", "--eval-minutes", "60", "--chunk-seconds", "1"])  # fmt: skip
+    time.sleep(8)
+    proc.send_signal(signal.SIGINT)
+    assert proc.wait(timeout=30) == 0
+    assert load_checkpoint(tmp_path / "latest.ntw")[3]["moves_trained"] > 0
