@@ -296,3 +296,31 @@ So for `rl_v2`, the old gate of 110 still catches deaths 1–3 moves ahead about
 | **search below 115, top 8** | **109** | **106,338** | **0.47 [0.36, 0.60]** | **10,594,480** | **8,695,410** | 0.12% |
 
 Gate 115 vs gate 110: 0.59 [0.46, 0.76]. The gate now lives in the checkpoint (`search_below`, 115 for `rl_v2`). Checkpoints without it, such as `rl_v1`, fall back to 110. `evaluate --search` and the viewer's "RL + lookahead" use the checkpoint's gate.
+
+### Where `rl_v2` + search still dies (ticket #10)
+
+The question was whether the remaining game overs could be prevented by more search, or only by a better value function.
+
+- **Method:**
+  - Play 64 games with `rl_v2` and gate-115 search (seed `4243`, 200,000-move cap), which gave 50 game overs.
+  - Keep the state 1, 3, 10 and 30 moves before each game over.
+  - Replay each state 16 times with freshly drawn pieces (the three pending pieces are kept), and count how often the agent is still alive 100 moves later.
+  - Compare three policies: plain 1-ply, gate 115, and search on every move for the first 40 moves.
+- The script was a one-off and is not in the repo.
+
+| Moves before the game over | 1-ply | Gate 115 | Search on every move | Gate fired (Q < 115) | Median best Q |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 0.66 | 0.67 | 0.69 | 98% | 80.7 |
+| 3 | 0.90 | 0.93 | 0.94 | 48% | 115.1 |
+| 10 | 0.996 | 0.999 | 0.999 | 2% | 117.3 |
+| 30 | 0.999 | 0.999 | 0.999 | 0% | 118.3 |
+
+- **No position was lost.** Even 1 move before a game over, two thirds of fresh draws survive the next 100 moves, and none of the 200 states died on all 16 replays. These games ended because of the particular pieces that came next.
+- **Ten moves out, the positions are ordinary.** Their survival matches that of a typical position (about 0.999 per 100 moves at 117k moves per game over). Their median Q is 117.3, against 118 overall. The danger builds up only over the last ~3 moves, where the gate already fires.
+- **More search has little left to gain.** Searching every move instead of gating:
+  - 1 move before: +0.02 [−0.01, +0.06] survival (bootstrap 95% CI over states)
+  - 3 moves before: +0.01 [−0.01, +0.04]
+  - It cost 44× the compute.
+- **Consequences:**
+  - Distilling the search into training is dropped. At gate 115 the search costs only about 20% more time, and it acts only in the last few moves, where the net already senses danger.
+  - What remains is the per-move risk of ordinary positions, which is a training problem, not a search problem.
