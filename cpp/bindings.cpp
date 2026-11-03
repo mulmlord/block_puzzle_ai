@@ -64,6 +64,13 @@ public:
         s_ = s;
     }
 
+    std::tuple<int, int, bool> step(int slot, int row, int col) {
+        if (done()) throw std::invalid_argument("game is over");
+        if (row < 0 || row >= bpa::N || col < 0 || col >= bpa::N) throw std::invalid_argument("move off the board");
+        const bpa::Placed a = std::visit([&](auto& rng) { return bpa::step(t_, s_, slot, row * bpa::N + col, rng); }, rng_);
+        return {a.points, a.lines, done()};
+    }
+
     std::vector<Move> legal_moves() const {
         std::vector<Move> moves;
         for (int slot = 0; slot < 3; slot++)
@@ -140,6 +147,7 @@ NB_MODULE(_engine, m) {
         .def("reset", &Game::reset)
         .def("set_state", &Game::set_state, nb::arg("board_lo"), nb::arg("board_hi"), nb::arg("pending"),
              nb::arg("score"), nb::arg("history"), "moves and lines restart at 0")
+        .def("step", &Game::step, nb::arg("slot"), nb::arg("row"), nb::arg("col"), "-> (points, lines, done)")
         .def("legal_moves", &Game::legal_moves, "(slot, row, col), slot-major then position ascending")
         .def("afterstates", &Game::afterstates, "(slot, row, col, board_lo, board_hi, points, lines) per legal move")
         .def("spawn_distribution", &Game::spawn_distribution)

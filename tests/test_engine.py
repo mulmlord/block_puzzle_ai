@@ -9,7 +9,7 @@ from block_puzzle_ai import _engine
 from block_puzzle_ai.batch_env import spawn_distribution as torch_spawn_distribution
 from block_puzzle_ai.batch_env import tables_for
 from block_puzzle_ai.engine import CppGame, cpp_tables, spawn_sequence
-from block_puzzle_ai.game import Game, PieceGenerator, clear_full_lines, placements, points_for
+from block_puzzle_ai.game import Game, Move, PieceGenerator, clear_full_lines, placements, points_for
 from block_puzzle_ai.pieces import all_pieces, load_piece_table
 
 SEEDS = [0, 1, 42, 999, 2**32 - 1, 2**32 + 5, 2**40 + 123, 2**64 - 1]
@@ -111,3 +111,53 @@ def test_set_state_rejects_bad_input():
     for pending in ([28, 0, 0], [-1, 0, 0], [0, 0]):
         with pytest.raises(ValueError):
             raw.set_state(0, 0, pending, 0, [-1, -1, -1])
+
+
+def assert_same(ref: Game, cpp: CppGame):
+    assert cpp.board == ref.board
+    assert cpp.pending == ref.pending
+    assert (cpp.score, cpp.moves, cpp.lines_cleared, cpp.done) == (ref.score, ref.moves, ref.lines_cleared, ref.done)
+    assert cpp.history == (ref.generator.history[:3] + [-1, -1, -1])[:3]
+
+
+@pytest.mark.parametrize("block", range(10))
+def test_trajectory_parity(block):
+    for seed in range(100 * block, 100 * block + 100):
+        ref, cpp, pick = Game(seed), CppGame(seed), random.Random(10_000 + seed)
+        for _ in range(2):  # the second game checks that reset keeps the spawn history
+            assert_same(ref, cpp)
+            while not ref.done:
+                moves = ref.legal_moves()
+                assert cpp.legal_moves() == moves
+                move = pick.choice(moves)
+                r = ref.step(move)
+                assert cpp.step(move) == (r.points, r.lines, r.done)
+                assert_same(ref, cpp)
+            ref.reset()
+            cpp.reset()
+
+
+DOT, SQUARE3 = load_piece_table()[0][0], load_piece_table()[8][0]  # as in tests/test_game.py
+CHECKER = sum(1 << (r * 10 + c) for r in range(10) for c in range(10) if (r + c) % 2 == 0)
+
+
+def test_step_errors():
+    g = CppGame(3)
+    g.set_state(1, [DOT] * 3, 0, [])  # cell (0, 0) filled
+    with pytest.raises(ValueError):
+        g.step(Move(0, 0, 0))  # occupied
+    with pytest.raises(ValueError):
+        g.step(Move(0, 10, 0))  # off the board
+    g.set_state(CHECKER, [SQUARE3] * 3, 0, [])  # no two empty cells are adjacent, and no line is full
+    assert g.done and g.legal_moves() == []
+    with pytest.raises(ValueError):
+        g.step(Move(0, 0, 1))
+
+
+def test_fast_rng_game_is_deterministic():
+    a, b = CppGame(5, fast_rng=True), CppGame(5, fast_rng=True)
+    pick = random.Random(0)
+    while not a.done:
+        move = pick.choice(a.legal_moves())
+        assert a.step(move) == b.step(move)
+    assert a.board == b.board and a.moves > 0

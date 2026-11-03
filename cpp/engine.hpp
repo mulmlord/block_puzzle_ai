@@ -185,4 +185,23 @@ void reset(const Tables& t, State& s, Rng& rng) {
     for (int& piece : s.pending) piece = spawn(t, 0, s.history, rng);
 }
 
+// onTouchEnded (game.Game.step): check the move, remove the slot (the other two keep their order),
+// spawn with the score *before* this move and append it, then place, clear and score.
+template <class Rng>
+Placed step(const Tables& t, State& s, int slot, int pos, Rng& rng) {
+    if (slot < 0 || slot > 2 || pos < 0 || pos >= CELLS) throw std::invalid_argument("move out of range");
+    const int piece = s.pending[slot];
+    if (!(legal_positions(t, s.board, piece) >> pos & 1)) throw std::invalid_argument("illegal move");
+    int k = 0;
+    for (int i = 0; i < 3; i++)
+        if (i != slot) s.pending[k++] = s.pending[i];
+    s.pending[2] = spawn(t, s.score, s.history, rng);
+    const Placed a = apply(t, s.board, piece, pos);
+    s.board = a.board;
+    s.score += a.points;
+    s.moves++;
+    s.lines += a.lines;
+    return a;
+}
+
 }  // namespace bpa

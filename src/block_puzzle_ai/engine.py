@@ -70,6 +70,14 @@ class CppGame:
     def done(self) -> bool:
         return self._game.done
 
+    def reset(self) -> None:
+        """restart(): empty board, score 0, three fresh pieces; the spawn history is kept."""
+        self._game.reset()
+
+    def step(self, move: Move) -> tuple[int, int, bool]:
+        """Play a legal move; returns (points, lines, done). Raises ValueError on an illegal move."""
+        return self._game.step(move.slot, move.row, move.col)
+
     def set_state(self, board: int, pending: Sequence[Piece], score: int, history: Sequence[int]) -> None:
         """Moves and lines restart at 0. Raises ValueError on boards beyond 100 cells or bad ids."""
         if board < 0 or board & ~_BOARD:
