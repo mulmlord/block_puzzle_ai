@@ -355,3 +355,51 @@ The question was whether the remaining game overs could be prevented by more sea
 - **Random play:** the targets were ≥ 1M moves/s on one thread and ≥ 10M on all threads. Both are beaten about 10×.
 - **After-state play** applies every legal move before each move (about 76 per move), which is the per-move work of a 1-ply learner before any value lookups. This sets the ceiling for CPU n-tuple training on this machine: about 8M moves/s, against the GPU trainer's 12.5k moves/s.
 - 12 → 24 threads adds only 27%: the second hyper-thread of each core shares its execution units.
+
+## n-tuple learner (ticket #10, technique 7)
+
+`block_puzzle_ai.ntuple` learns a symmetric n-tuple value function by TD(0) on after-states, on the C++ engine. Training is lock-free on 24 threads, and the agent plays greedy 1-ply. The design is in `docs/superpowers/specs/2026-11-03-ntuple-learner-design.md`.
+- Features: tuple shapes `window4` and `line`, plus fit counts for each piece group and for the 2 remaining pieces.
+- Settings: γ = 1, restart fraction 0.5.
+
+### Getting a stable 1-hour run
+
+The first two launches failed:
+- **Divergence after 12M moves:** with α 0.1 on 24 threads, the mean value went from 1.3M to 4.5e22, then to NaN.
+  - Stale concurrent updates on shared hot weights make the effective step grow with α × threads. 1 and 4 threads at α 0.1 were stable; 12 were not.
+  - The α cap now defaults to min(0.1, 0.5 / threads), which is 0.021 at 24 threads. Non-finite values raise an error instead of crashing the process.
+- **Collapse after 480M moves (43 min):** the run had reached 25k moves per game over. Within 2 minutes it fell to 29 moves per game and never recovered.
+  - Cause: with γ = 1, each game over moves its weights by about α × V. Once V is about 2.4M, a chance cluster of game overs reorders the policy, which causes more game overs.
+  - It could be provoked on demand from the 32-minute checkpoint (1% random moves for 3M moves), and a quarter of the step size survived it. The restart pool and lock-free races were ruled out. The collapsed state is permanent: it can only be left by rescaling the weights.
+  - Fix: after every 10-second chunk, α = min(cap, 12,500 / mean V).
+  - A rollback guard backs this up. If a chunk has ≥ 50 game overs at more than 4× the recent median rate, or mean V falls below 0.8× its recent maximum, the guard restores the weights from up to 3 chunks earlier and halves the cap.
+
+### 1-hour run `runs/nt1h`
+
+Command: `uv run python -m block_puzzle_ai.ntuple train --out runs/nt1h --hours 1`
+
+- **627M moves in 60.7 min.** That is 1.6× the moves of the whole 9.8-hour `rl_v2` run.
+- **Throughput:** median 183.5k moves/s over the last 10 chunks (225k in the first chunk, while games are short). The target was ≥ 200k. It has not been profiled.
+- **Stability:** the guard never fired. α fell smoothly from 0.021 to 0.0052 as mean V rose from 38k to 2.39M.
+
+Periodic evaluations (256 games, seed `2024`, 200,000-move cap):
+
+| Minutes | Moves trained | Mean | Median | Moves / game over | Points / move |
+|---:|---:|---:|---:|---:|---:|
+| 16 | 161M | 2,221,902 | 1,603,245 | 27,761 | 80 |
+| 31 | 321M | 2,283,489 | 1,537,010 | 28,487 | 80 |
+| **47 (`best.ntw`)** | **481M** | **2,826,588** | **1,985,890** | **35,526** | 80 |
+| 61 | 627M | 2,730,577 | 1,988,640 | 34,101 | 80 |
+
+Long evaluation (the ticket's protocol: 64 games, seed `777`, 200,000-move cap; `uv run python -m block_puzzle_ai.ntuple evaluate --weights runs/nt1h/best.ntw --games 64 --seed 777 --max-moves 200000`):
+
+| | Mean | Median | Min | Max | Moves / game over | Points / move | Alive at cap | Time |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `rl_v1` | 2,595,820 | 1,831,945 | 31,110 | 11,750,010 | 23,958 | 108 | 0 | 26 min |
+| **`rl_v2`** | **6,507,274** | **4,665,275** | 12,110 | 23,400,040 | **57,402** | **117** | 2 | 10 min |
+| n-tuple, 1 h | 2,285,927 | 1,658,510 | 121,290 | 9,750,180 | 28,622 | 80 | 0 | 31 s |
+
+- **vs `rl_v2`:** mean −4.22M, bootstrap 95% CI [−5.80M, −2.73M]. Death rate 2.01 [1.41, 2.84].
+- **Points per move are the larger gap.** They have stayed at 80 since the first evaluation, against 117 for `rl_v2` and 108 for `rl_v1`. Even with `rl_v2`'s survival, 80 points per move would give a mean of only about 4.6M.
+- **Survival is still rising,** and it already beats `rl_v1`'s 24.0k moves per game over. The best evaluation came at 47 minutes, and the last one was within noise of it.
+- The plan's 1-hour gate (≥ 1,000 moves per game over) is passed, so the 8-hour run comes next.
