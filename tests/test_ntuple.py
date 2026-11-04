@@ -15,6 +15,7 @@ from block_puzzle_ai.engine import CppGame, cpp_tables
 from block_puzzle_ai.game import placements
 from block_puzzle_ai.ntuple import evaluate as nt_evaluate
 from block_puzzle_ai.ntuple import (
+    CollapseGuard,
     NTupleConfig,
     fit_bucket,
     load_checkpoint,
@@ -22,6 +23,7 @@ from block_puzzle_ai.ntuple import (
     main,
     make_model,
     save_checkpoint,
+    scheduled_alpha,
     shape_cells,
     shapes_to_tuples,
     transform_board,
@@ -300,3 +302,55 @@ def test_default_alpha_scales_with_threads(tmp_path):
         main(["train", "--out", str(out), "--total-moves", "20000", "--threads", str(threads), "--shapes", "line",
               "--eval-games", "2", "--eval-max-moves", "100"])  # fmt: skip
         assert load_checkpoint(out / "latest.ntw")[0].alpha == pytest.approx(alpha)
+
+
+def test_scheduled_alpha_follows_value_scale():
+    assert scheduled_alpha(0.0208, 12_500, 2_400_000) == pytest.approx(12_500 / 2_400_000)
+    assert scheduled_alpha(0.0208, 12_500, 100_000) == pytest.approx(0.0208)  # capped while V is small
+    assert scheduled_alpha(0.0208, 12_500, 0.0) == pytest.approx(0.0208)
+
+
+def test_collapse_guard():
+    guard = CollapseGuard()
+    for _ in range(4):
+        assert not guard.check(deaths=20, moves=2_000_000, value_mean=2.4e6)
+    assert not guard.check(2000, 2_000_000, 2.4e6)  # too little history to judge
+    guard = CollapseGuard()
+    for _ in range(10):
+        assert not guard.check(20, 2_000_000, 2.4e6)
+    assert not guard.check(78, 2_000_000, 2.0e6)  # within 4x deaths and 0.8x value
+    assert guard.check(100, 2_000_000, 2.4e6)  # death spike
+    assert guard.check(20, 2_000_000, 1.8e6)  # value drop
+    assert not guard.check(20, 2_000_000, 2.5e6)  # flagged chunks stay out of the history
+    guard = CollapseGuard()
+    for _ in range(10):
+        assert not guard.check(2, 2_000_000, 9e7)
+    assert not guard.check(12, 2_000_000, 9e7)  # 6x, but too few deaths to be more than noise
+
+
+def test_value_mean_reports_v_for_gamma_below_one():
+    model = make_model(shapes_to_tuples(["line"]))
+    model.weights[:] = 1000.0 / model.n_lookups  # V = 1000 everywhere
+    stats = _engine.Trainer(model, 0.5, 0.0, 0.5, 1, 0).run(200)  # alpha 0: weights stay put
+    assert stats["value_mean"] == pytest.approx(1000.0, rel=1e-4)
+
+
+def test_train_schedules_alpha_and_rolls_back(tmp_path, monkeypatch):
+    calls = {"n": 0}
+
+    def flag_third(self, deaths, moves, value_mean):
+        calls["n"] += 1
+        return calls["n"] == 3
+
+    monkeypatch.setattr(CollapseGuard, "check", flag_third)
+    main(["train", "--out", str(tmp_path), "--total-moves", "300000", "--threads", "2", "--shapes", "line",
+          "--alpha", "0.02", "--alpha-k", "10", "--eval-minutes", "60", "--eval-games", "2", "--eval-max-moves", "100",
+          "--chunk-seconds", "0.05"])  # fmt: skip
+    records = [json.loads(line) for line in (tmp_path / "metrics.jsonl").read_text().splitlines()]
+    rollbacks = [r for r in records if r["type"] == "rollback"]
+    assert len(rollbacks) == 1 and rollbacks[0]["alpha_cap"] == pytest.approx(0.01)
+    trains = [r for r in records if r["type"] == "train"]
+    later = trains[trains.index(next(r for r in trains if r["moves"] > rollbacks[0]["moves"])) :]
+    assert all(r["alpha"] <= 0.01 + 1e-9 for r in later)
+    assert any(r["alpha"] < 0.01 - 1e-6 for r in later)  # the value schedule (K / V) is below the cap once V grows
+    assert load_checkpoint(tmp_path / "latest.ntw")[0].alpha == pytest.approx(0.01)

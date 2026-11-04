@@ -194,7 +194,8 @@ private:
 struct Choice {
     int slot = 0, pos = 0, points = 0;
     Afterstate after;
-    double q = 0;  // points + gamma * V(after)
+    double v = 0;  // V(after)
+    double q = 0;  // points + gamma * v
 };
 
 // Greedy 1-ply move: argmax over legal moves of points + gamma * V(after-state), first maximum in engine
@@ -213,8 +214,8 @@ inline bool best_move(const NTuple& nt, const State& s, float gamma, Choice& out
         for_each_bit(legal_positions(t, s.board, piece), [&](int pos) {
             const Placed p = apply(t, s.board, piece, pos);
             a.board = p.board;
-            const double q = p.points + gamma * nt.value(a);
-            if (!found || q > best) best = q, found = true, out = {slot, pos, p.points, a, q};
+            const double v = nt.value(a), q = p.points + gamma * v;
+            if (!found || q > best) best = q, found = true, out = {slot, pos, p.points, a, v, q};
         });
     }
     return found;
@@ -373,7 +374,7 @@ private:
                 game_over(w, st);
                 new_game(w, st);
             }
-            st.value_sum += w.choice.q - w.choice.points;
+            st.value_sum += w.choice.v;
         }
         st.moves = moves;
         return st;

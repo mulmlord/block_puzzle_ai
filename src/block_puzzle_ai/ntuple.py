@@ -10,8 +10,10 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import statistics
 import struct
 import time
+from collections import deque
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -124,7 +126,8 @@ def evaluate(
 class NTupleConfig:
     shapes: list[str] = field(default_factory=lambda: ["window4", "line"])
     gamma: float = 1.0
-    alpha: float = 0.1
+    alpha: float = 0.1  # step-size cap; rollbacks halve it
+    alpha_k: float = 12_500.0  # the step size follows min(alpha, alpha_k / mean V)
     restart_frac: float = 0.5
     threads: int = 24
     seed: int = 0
@@ -174,6 +177,46 @@ def load_model(path: str | Path) -> tuple[_engine.NTuple, NTupleConfig, dict]:
     return model, cfg, meta
 
 
+# ---- training stability (docs/RESULTS.md, "n-tuple learner") ------------------------------------------
+
+
+def scheduled_alpha(cap: float, k: float, value_mean: float) -> float:
+    """Step size for the next chunk: min(cap, k / mean V).
+
+    With gamma = 1 every game over moves its weights by about alpha * V / n_lookups. Once that is large next
+    to the gaps between moves, a chance cluster of game overs reorders the policy, which causes more game
+    overs: the trained net collapses to random play and does not recover. Scaling alpha with 1 / V keeps
+    the per-game-over shift constant.
+    """
+    return cap if value_mean <= 0 else min(cap, k / value_mean)
+
+
+class CollapseGuard:
+    """Flags a chunk whose death rate or mean value breaks from the recent healthy chunks.
+
+    A chunk is flagged when, with at least ``min_history`` healthy chunks on record, its game overs per move
+    exceed ``death_factor`` times their median (and it had at least ``min_deaths`` game overs, so Poisson
+    noise in long-game chunks does not count), or its mean V falls below ``value_drop`` times their maximum.
+    Flagged chunks are not added to the history.
+    """
+
+    def __init__(
+        self, window: int = 10, min_history: int = 5, death_factor: float = 4.0, value_drop: float = 0.8, min_deaths: int = 50
+    ):
+        self.history: deque[tuple[float, float]] = deque(maxlen=window)
+        self.min_history, self.death_factor, self.value_drop, self.min_deaths = min_history, death_factor, value_drop, min_deaths
+
+    def check(self, deaths: int, moves: int, value_mean: float) -> bool:
+        rate = deaths / max(moves, 1)
+        if len(self.history) >= self.min_history:
+            median_rate = statistics.median(r for r, _ in self.history)
+            max_value = max(v for _, v in self.history)
+            if (deaths >= self.min_deaths and rate > self.death_factor * median_rate) or value_mean < self.value_drop * max_value:
+                return True
+        self.history.append((rate, value_mean))
+        return False
+
+
 # ---- CLI ----------------------------------------------------------------------------------------------
 
 
@@ -186,7 +229,8 @@ def _best_so_far(metrics: Path) -> float:
 def train(args: argparse.Namespace) -> None:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    overrides = {k: getattr(args, k) for k in ("alpha", "restart_frac", "threads", "seed") if getattr(args, k) is not None}
+    names = ("alpha", "alpha_k", "restart_frac", "threads", "seed")
+    overrides = {k: getattr(args, k) for k in names if getattr(args, k) is not None}
     if args.resume:
         model, cfg, meta = load_model(out / "latest.ntw")
         if args.shapes is not None and args.shapes.split(",") != cfg.shapes:
@@ -200,13 +244,17 @@ def train(args: argparse.Namespace) -> None:
         if args.gamma is not None:
             base["gamma"] = args.gamma
         cfg = NTupleConfig(**(base | overrides))
-        if args.alpha is None:  # lock-free updates diverge once alpha * threads exceeds ~1 (docs/RESULTS.md)
+        if args.alpha is None:  # from scratch, 24 threads at 0.1 inflated V 20x within 1M moves (docs/RESULTS.md)
             cfg.alpha = min(0.1, 0.5 / cfg.threads)
         model = make_model(shapes_to_tuples(cfg.shapes))
         moves, elapsed0 = 0, 0.0
     tuples = [list(t) for t in model.tuples]
     # mixing in the moves so far gives a resumed run fresh random streams
-    trainer = _engine.Trainer(model, cfg.gamma, cfg.alpha, cfg.restart_frac, cfg.threads, cfg.seed + moves)
+    trainer = _engine.Trainer(model, cfg.gamma, 0.0, cfg.restart_frac, cfg.threads, cfg.seed + moves)
+    probe = trainer.run(1000 * cfg.threads)  # alpha 0: measures V before the first learning chunk; not counted
+    trainer.alpha = scheduled_alpha(cfg.alpha, cfg.alpha_k, probe["value_mean"])
+    guard = CollapseGuard()
+    snapshots: deque[np.ndarray] = deque([model.weights.copy()], maxlen=3)
     metrics = (out / "metrics.jsonl").open("a")
     best = _best_so_far(out / "metrics.jsonl")
     start = time.perf_counter()
@@ -252,6 +300,17 @@ def train(args: argparse.Namespace) -> None:
             keys = ("games", "deaths", "mean_score", "mean_moves", "restarts", "value_mean")
             log({"type": "train", "moves_per_s": round(rate)} | {k: st[k] for k in keys} | {"alpha": trainer.alpha})
             print(f"[train] {moves:,} moves, {rate:,.0f}/s, games {st['games']}, mean {st['mean_score']:,.0f}", flush=True)
+            if guard.check(st["deaths"], st["moves"], st["value_mean"]):
+                model.weights[:] = snapshots[0]
+                snapshots = deque([snapshots[0]], maxlen=3)
+                cfg.alpha /= 2
+                log({"type": "rollback", "deaths": st["deaths"], "value_mean": st["value_mean"], "alpha_cap": cfg.alpha})
+                print(f"[rollback] {moves:,} moves: restored weights from up to 3 chunks ago, alpha cap {cfg.alpha:.4g}", flush=True)
+                healthy_v = max((v for _, v in guard.history), default=st["value_mean"])
+                trainer.alpha = scheduled_alpha(cfg.alpha, cfg.alpha_k, healthy_v)
+            else:
+                snapshots.append(model.weights.copy())
+                trainer.alpha = scheduled_alpha(cfg.alpha, cfg.alpha_k, st["value_mean"])
             if elapsed() - last_eval >= args.eval_minutes:
                 evaluate_and_save()
                 last_eval = elapsed()
@@ -286,7 +345,8 @@ def main(argv: list[str] | None = None) -> None:
     t.add_argument("--resume", action="store_true", help="continue from OUT/latest.ntw")
     t.add_argument("--shapes", help="comma-separated tuple shapes (default window4,line)")
     t.add_argument("--gamma", type=float)
-    t.add_argument("--alpha", type=float, help="TD step size (default min(0.1, 0.5 / threads))")
+    t.add_argument("--alpha", type=float, help="step-size cap (default min(0.1, 0.5 / threads))")
+    t.add_argument("--alpha-k", type=float, help="the step size follows min(cap, ALPHA_K / mean V) (default 12500)")
     t.add_argument("--restart-frac", type=float)
     t.add_argument("--threads", type=int)
     t.add_argument("--seed", type=int)
@@ -294,7 +354,7 @@ def main(argv: list[str] | None = None) -> None:
     t.add_argument("--eval-games", type=int, default=256)
     t.add_argument("--eval-seed", type=int, default=2024)
     t.add_argument("--eval-max-moves", type=int, default=200_000)
-    t.add_argument("--chunk-seconds", type=float, default=60)
+    t.add_argument("--chunk-seconds", type=float, default=10, help="training chunk length; the collapse guard checks each chunk")
     e = sub.add_parser("evaluate", help="greedy 1-ply games with a checkpoint")
     e.add_argument("--weights", required=True)
     e.add_argument("--games", type=int, default=64)

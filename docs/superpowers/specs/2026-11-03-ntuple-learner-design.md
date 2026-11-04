@@ -100,7 +100,13 @@ loop:
 - **The update** is `δ = target − V(a)`. Each weight looked up for `a` gets `+= α·δ / n_lookups`, where `n_lookups = 8·n_tuples + 14`.
 - **Defaults:**
   - **γ = 1**, so V is the expected remaining score.
-  - **α = 0.1**, constant. It can be changed when a run resumes, which allows manual step-downs.
+  - **α:** constant 0.1 was the original plan. Execution changed it, as recorded in the ledger and in `docs/RESULTS.md`:
+    - After each chunk, `α = min(cap, 12,500 / mean V)`. The cap defaults to `min(0.1, 0.5 / threads)`.
+    - With γ = 1, every game over moves its weights by about α·V/134. A constant α let a chance cluster of game overs tip the trained net into a permanent collapse.
+  - **A rollback guard:**
+    - Training runs in 10-second chunks, and each chunk is checked.
+    - A chunk is flagged if it has ≥ 50 game overs at more than 4× the median rate of the last 10 healthy chunks, or if its mean V falls below 0.8× their maximum.
+    - A flagged chunk restores the weights from up to 3 chunks earlier and halves the cap.
   - The weights start at 0.
   - There is no ε: the spawns provide the exploration.
 - **Restarts** (as the `rl_v2` run's `RestartPool`):
