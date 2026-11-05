@@ -27,6 +27,7 @@ The 20,000-move cap *understates* the RL agents: 54 of the 128 `rl_v1` games wer
 | `rl_v1` + lookahead search | 5,985,303 | 4,408,550 | 56,043 | | |
 | **`rl_v2`** | **6,507,274** | **4,665,275** | **57,402** | **6,824,363** | **38,818,140** |
 | **`rl_v2` + lookahead search** | **11,158,066**\* | **7,589,755** | **117,387** | | |
+| n-tuple `runs/nt1/best.ntw` (8 h, CPU) | 6,192,662 | 4,224,940 | 72,672 | | |
 
 \*12 of the 64 games were still alive at the cap, so this is a lower bound.
 
@@ -34,6 +35,7 @@ The 20,000-move cap *understates* the RL agents: 54 of the 128 `rl_v1` games wer
   - **High score: 38,818,140 points** in a single 331,683-move game, without search.
   - It survives about 2.4× longer and scores 117 instead of 108 points per move.
 - **Lookahead search** (`--search`) adds +4.65M [+2.13M, +7.12M] to `rl_v2`'s mean, 1.7×, and halves its death rate.
+- **n-tuple learner** (ticket #10, technique 7): 8 hours of TD(0) on the C++ engine tie `rl_v2`'s mean (−0.31M [−2.35M, +1.76M]). It survives longer but scores 94 instead of 117 points per move. One of its games scored **42,324,610**, the highest yet, with a 10M-move cap ([results](docs/RESULTS.md#8-hour-run-runsnt1)).
 - See [`docs/RESULTS.md`](docs/RESULTS.md).
 - **Scoring efficiency:** the agent scores more points per move than the heuristic because it deliberately sets up multi-line clears. The game pays `50·L·(L+1)` for `L` simultaneous lines.
 

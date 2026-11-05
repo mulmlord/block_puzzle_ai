@@ -403,3 +403,75 @@ Long evaluation (the ticket's protocol: 64 games, seed `777`, 200,000-move cap; 
 - **Points per move are the larger gap.** They have stayed at 80 since the first evaluation, against 117 for `rl_v2` and 108 for `rl_v1`. Even with `rl_v2`'s survival, 80 points per move would give a mean of only about 4.6M.
 - **Survival is still rising,** and it already beats `rl_v1`'s 24.0k moves per game over. The best evaluation came at 47 minutes, and the last one was within noise of it.
 - The plan's 1-hour gate (≥ 1,000 moves per game over) is passed, so the 8-hour run comes next.
+
+### γ pilot
+
+With γ = 1, points per move stayed at 80. The suspected cause was that a V of millions drowns the multi-line bonus `50·L·(L+1)`. So before the 8-hour run, three short runs were compared at 161M moves each, on 12 threads (the other 12 were busy), with the same evaluation as the periodic one (256 games, seed `2024`, 200,000-move cap):
+
+| γ | Threads | Mean | Moves / game over | Points / move | α at 161M |
+|---:|---:|---:|---:|---:|---:|
+| 1 (1-hour run) | 24 | 2,221,902 | 27,761 | 80.4 | 0.0084 |
+| 1 (control) | 12 | 1,566,358 | 19,461 | 80.5 | 0.0082 |
+| **0.999** | 12 | **3,356,660** | **40,006** | 84.6 | 0.0417 |
+| 0.9995 | 12 | 3,201,683 | 39,370 | 82.0 | 0.0417 |
+
+- **The points-per-move explanation was wrong.** γ < 1 adds only 2–4 points per move.
+- **Survival doubled,** and the thread count does not explain it. But γ comes bundled with the step size: with γ 0.999, V stays near 81k, so the schedule `min(cap, 12,500 / V)` never lowers α below its cap.
+- Each row is a single evaluation, and snapshots of one run vary more than that: at 110M moves, γ 0.999 and the γ = 1 control were level (25.7k and 24.9k moves per game over).
+- γ 0.999 was chosen for the 8-hour run.
+
+### 8-hour run `runs/nt1`
+
+Command: `uv run python -m block_puzzle_ai.ntuple train --out runs/nt1 --hours 8 --gamma 0.999`
+
+- **9.16 billion moves in 480.7 min,** at about 300k moves/s on 24 threads. That is 23× the moves of the whole `rl_v2` run.
+- **The best weights came after 62 minutes.** From 47 to 78 minutes the run held about 70k moves per game over and 93–94 points per move.
+- **A collapse at about 80 minutes.** Training moves per game over fell from 73k to 3.6k within 10 minutes, at α 0.0013. So γ < 1 does not prevent collapses.
+  - The guard fired 8 times in all: 4 times between 32 and 49 minutes, and 4 more within 2 minutes at 81–83 minutes. Each one halved the α cap, from 0.021 to **8.1·10⁻⁵**, 1/256 of the start.
+  - The rollbacks did not stop the collapse. They restore weights at most 3 chunks (30 s) back, which was already inside it.
+- **After the collapse, the run cycled for 6.5 hours without beating its 62-minute best.** α stayed at 8.1·10⁻⁵. Training moves per game over swung between about 12k and 60k, in cycles of about 90 minutes, and V rose and fell with them (78k–83k). The last hour sat on the top of one cycle: 57.5k, 59.4k, 58.0k and 56.9k moves per game over in the periodic evaluations.
+- Points per move follow survival: 93–94 at the best, 81–83 in the troughs.
+
+Periodic evaluations (256 games, seed `2024`, 200,000-move cap), selected:
+
+| Minutes | Moves trained | Mean | Moves / game over | Points / move |
+|---:|---:|---:|---:|---:|
+| 16 | 0.25B | 3,636,322 | 42,751 | 86 |
+| 31 | 0.52B | 485,191 | 6,097 | 80 |
+| 47 | 0.77B | 6,205,611 | 70,341 | 93 |
+| **62 (`best.ntw`)** | **1.04B** | **6,319,104** | **70,785** | **94** |
+| 78 | 1.31B | 6,029,913 | 68,235 | 94 |
+| 93 | 1.70B | 209,775 | 2,682 | 78 |
+| 124 | 2.36B | 4,258,370 | 53,036 | 82 |
+| 325 | 6.20B | 902,329 | 11,130 | 81 |
+| 371 | 7.08B | 4,377,927 | 53,168 | 85 |
+| 417 | 7.99B | 1,004,416 | 12,363 | 81 |
+| 464 | 8.88B | 4,901,886 | 59,379 | 85 |
+| 481 | 9.16B | 4,667,025 | 56,906 | 85 |
+
+All 32 evaluations are in `runs/nt1/metrics.jsonl`.
+
+### Acceptance
+
+Long evaluation (64 games, seed `777`; `uv run python -m block_puzzle_ai.ntuple evaluate --weights runs/nt1/best.ntw --games 64 --seed 777 --max-moves 200000 --json`). Death rates are relative to `rl_v2`, with Poisson 95% CIs (`scripts/ab_compare.py`):
+
+| | Cap | Mean | Median | Min | Max | Moves / game over | Points / move | Alive at cap | Death rate | Time |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **`rl_v2`** | 200k | **6,507,274** | 4,665,275 | 12,110 | 23,400,040 | 57,402 | **117** | 2 | 1 | 10 min |
+| n-tuple, 1 h | 200k | 2,285,927 | 1,658,510 | 121,290 | 9,750,180 | 28,622 | 80 | 0 | 2.01 [1.41, 2.84] | 31 s |
+| **n-tuple, 8 h (`best.ntw`)** | 200k | 6,192,662 | 4,224,940 | 19,940 | 18,863,510 | **72,672** | 94 | 6 | 0.79 [0.55, 1.13] | 12 s |
+| n-tuple, 8 h (`latest.ntw`) | 200k | 5,788,879 | **5,220,285** | 117,420 | 17,087,440 | 71,167 | 85 | 3 | 0.81 [0.57, 1.15] | 13 s |
+| n-tuple, 8 h (`best.ntw`) | 10M | 7,111,924 | 4,224,940 | 19,940 | **42,324,610** | 75,645 | 94 | 0 | | 17 s |
+
+- **Verdict: not passed.** The mean is −0.31M against `rl_v2`, bootstrap 95% CI [−2.35M, +1.76M], so the two are statistically tied. The plan's bar was a lower bound above 0.
+- **Survival is better than `rl_v2`'s for the first time,** at 72.7k against 57.4k moves per game over, but the death rate (0.79 [0.55, 1.13]) is not significantly lower.
+- **Points per move are the whole gap:** 94 against 117. With `rl_v2`'s points per move, the same moves per game (65.9k at this cap) would give a mean of about 7.7M.
+- **vs the 1-hour run:** +3.91M [+2.42M, +5.46M].
+- **High score: 42,324,610 points** in one 451,088-move game without search, with the 10M cap. That beats `rl_v2`'s 38,818,140 (on the 256 seeds `2026`), though on different seeds.
+- **Evaluation is about 48× faster than `rl_v2`'s**: 12 s against 593 s for the same 64 games.
+
+### Next methods, in order
+
+1. **Lookahead search on the n-tuple agent.** Search added +4.65M (1.7×) to `rl_v2` and halved its death rate. Evaluation here is 48× cheaper, so deeper or ungated search is affordable. It needs no retraining.
+2. **Training stability.** Replace the guard's halving, which froze α at 1/256 after 83 minutes, with per-weight adaptive steps (temporal-coherence learning, the usual choice for 2048 n-tuple networks). Also look at why survival cycles every ~90 minutes even at tiny α. One guess is that danger states are forgotten when game overs become rare. Rollbacks need a longer window to be of any use.
+3. **Points per move.** γ was ruled out, so the features are next: tuple shapes that can represent setups for clearing several lines at once.
