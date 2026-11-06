@@ -323,15 +323,25 @@ def train(args: argparse.Namespace) -> None:
 
 
 def evaluate_cmd(args: argparse.Namespace) -> None:
-    model, cfg, _ = load_model(args.weights)
-    start = time.perf_counter()
-    results = evaluate(model, args.games, args.seed, args.max_moves, args.threads, cfg.gamma)
-    summary = summarize(results) | {"agent": f"ntuple:{args.weights}", "seconds": round(time.perf_counter() - start, 1)}
-    if args.json:
-        print(json.dumps(summary | {"results": [asdict(r) for r in results]}))
+    from block_puzzle_ai import ntuple_search
+
+    if ntuple_search.search_requested(args):
+        tiers = ntuple_search.tiers_from_args(args.search_k, args.search_below, args.deep_below, args.deep_k)
+        out = ntuple_search.run_search_eval(
+            args.weights, args.games, args.seed, args.max_moves, args.threads, tiers, args.games_file
+        )
     else:
-        for k, v in summary.items():
-            print(f"{k:>20}: {v:,.1f}" if isinstance(v, float) else f"{k:>20}: {v}")
+        model, cfg, _ = load_model(args.weights)
+        start = time.perf_counter()
+        results = evaluate(model, args.games, args.seed, args.max_moves, args.threads, cfg.gamma)
+        out = summarize(results) | {"agent": f"ntuple:{args.weights}", "seconds": round(time.perf_counter() - start, 1)}
+        out["results"] = [asdict(r) for r in results]
+    if args.json:
+        print(json.dumps(out))
+    else:
+        for k, v in out.items():
+            if k != "results":
+                print(f"{k:>20}: {v:,.1f}" if isinstance(v, float) else f"{k:>20}: {v}")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -355,13 +365,19 @@ def main(argv: list[str] | None = None) -> None:
     t.add_argument("--eval-seed", type=int, default=2024)
     t.add_argument("--eval-max-moves", type=int, default=200_000)
     t.add_argument("--chunk-seconds", type=float, default=10, help="training chunk length; the collapse guard checks each chunk")
-    e = sub.add_parser("evaluate", help="greedy 1-ply games with a checkpoint")
+    e = sub.add_parser("evaluate", help="games with a checkpoint: greedy 1-ply, or searched with the search options")
     e.add_argument("--weights", required=True)
     e.add_argument("--games", type=int, default=64)
     e.add_argument("--seed", type=int, default=777)
     e.add_argument("--max-moves", type=int, default=200_000)
     e.add_argument("--threads", type=int, default=24)
     e.add_argument("--json", action="store_true", help="print evaluate.py-style JSON, with per-game results")
+    s = e.add_argument_group("search (docs/superpowers/specs/2026-11-05-ntuple-search-design.md)")
+    s.add_argument("--search-k", type=int, help="depth-2 search on the top K moves, on every move")
+    s.add_argument("--search-below", type=float, help="search only when the best 1-ply value is below this (K default 8)")
+    s.add_argument("--deep-below", type=float, help="depth-3 search when the best 1-ply value is below this")
+    s.add_argument("--deep-k", type=lambda v: [int(x) for x in v.split(",")], help="depth-3 widths K1,K2")
+    s.add_argument("--games-file", help="per-game JSONL; rerunning with the same arguments plays only missing games")
     args = parser.parse_args(argv)
     train(args) if args.command == "train" else evaluate_cmd(args)
 

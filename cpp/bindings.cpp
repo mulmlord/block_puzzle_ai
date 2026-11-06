@@ -293,6 +293,10 @@ NB_MODULE(_engine, m) {
         "searched move -> (slot, pos, q, tier, changed), or None with no legal move; tier -1 = 1-ply");
 
     m.def(
+        "check_search_tiers", [](const PyTiers& tiers) { read_tiers(tiers); }, nb::arg("tiers"),
+        "raise ValueError unless below strictly decreases, depth does not decrease and widths are >= 0");
+
+    m.def(
         "evaluate_ntuple_search",
         [](const bpa::NTuple& nt, int games, uint64_t seed, int64_t max_moves, int threads, float gamma, const PyTiers& tiers,
            const std::vector<int>& skip, nb::object on_game) {

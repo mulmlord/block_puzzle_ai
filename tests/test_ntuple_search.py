@@ -6,6 +6,8 @@ Spec: docs/superpowers/specs/2026-11-05-ntuple-search-design.md, section "Search
 import json
 import math
 import random
+import subprocess
+import sys
 import time
 from collections import Counter
 from pathlib import Path
@@ -16,7 +18,8 @@ import pytest
 from block_puzzle_ai import _engine
 from block_puzzle_ai.engine import CppGame
 from block_puzzle_ai.game import Move
-from block_puzzle_ai.ntuple import load_model, make_model, shapes_to_tuples, value
+from block_puzzle_ai.ntuple import NTupleConfig, load_model, main, make_model, save_checkpoint, shapes_to_tuples, value
+from block_puzzle_ai.ntuple_search import run_search_eval, tiers_from_args
 from block_puzzle_ai.pieces import HARD_GROUPS, all_pieces
 
 DATA = Path(__file__).parent / "data"
@@ -317,3 +320,97 @@ def test_game_replays_with_search_move():
             game.step(Move(slot, pos // 10, pos % 10))
         assert (game.score, game.moves, game.lines_cleared, False) == (score, moves, lines, truncated)
         assert used == searched and last_q1 == best_q1[-20:]
+
+
+# ---- ntuple_search: tiers, games file, CLI ---------------------------------------------------------------
+
+
+def test_tiers_from_args():
+    assert tiers_from_args(4, None, None, None) == [(INF, [4])]
+    assert tiers_from_args(None, 7e4, None, None) == [(7e4, [8])]
+    assert tiers_from_args(2, 7e4, None, None) == [(7e4, [2])]
+    assert tiers_from_args(4, None, 6e4, [8, 4]) == [(INF, [4]), (6e4, [8, 4])]
+    assert tiers_from_args(None, None, None, None) == []
+    for bad in ((4, None, None, [8, 4]), (4, None, 6e4, None), (4, None, 6e4, [8, 4, 2]), (None, 5e4, 6e4, [8, 4])):
+        with pytest.raises(SystemExit):
+            tiers_from_args(*bad)
+
+
+@pytest.fixture
+def checkpoint(tmp_path):
+    tuples, model = random_model()
+    path = tmp_path / "m.ntw"
+    save_checkpoint(path, NTupleConfig(gamma=0.999), tuples, model.weights, 0, 0.0)
+    return path
+
+
+def test_run_search_eval_uses_checkpoint_gamma(tmp_path):
+    """The checkpoint's gamma reaches the search. 0.5, not the real 0.999: scaling V by 0.999 seldom reorders moves,
+    so a dropped gamma would not show."""
+    tuples, model = random_model()
+    model.weights[:] *= 10  # value differences comparable to the rewards
+    path = tmp_path / "g05.ntw"
+    save_checkpoint(path, NTupleConfig(gamma=0.5), tuples, model.weights, 0, 0.0)
+    out = run_search_eval(path, 4, 2, 200, 2, [(INF, [2])], tmp_path / "g.jsonl")
+    scores_ = [r["score"] for r in out["results"]]
+    assert scores_ == [r[1] for r in run_search(model, 4, 2, 200, 2, [(INF, [2])], gamma=0.5)]
+    assert scores_ != [r[1] for r in run_search(model, 4, 2, 200, 2, [(INF, [2])], gamma=1.0)]
+    assert json.loads((tmp_path / "g.jsonl").read_text().splitlines()[0])["gamma"] == 0.5
+
+
+def eval_args(checkpoint, games_file, seed=4, max_moves=150, tiers=None):
+    return dict(weights=checkpoint, games=6, seed=seed, max_moves=max_moves, threads=3,
+                tiers=tiers or [(INF, [2]), (40.0, [3])], games_file=games_file)  # fmt: skip
+
+
+def test_resume_matches_full_run(checkpoint, tmp_path):
+    a = run_search_eval(**eval_args(checkpoint, tmp_path / "a.jsonl"))
+    lines = (tmp_path / "a.jsonl").read_text().splitlines()
+    assert len(lines) == 7 and a["games"] == 6
+    (tmp_path / "b.jsonl").write_text("\n".join(lines[:4]) + "\n")
+    b = run_search_eval(**eval_args(checkpoint, tmp_path / "b.jsonl"))
+    assert b["results"] == a["results"] and b["search"]["searched"] == a["search"]["searched"]
+    assert len((tmp_path / "b.jsonl").read_text().splitlines()) == 7
+
+
+def test_resume_drops_partial_last_line(checkpoint, tmp_path):
+    a = run_search_eval(**eval_args(checkpoint, tmp_path / "a.jsonl"))
+    lines = (tmp_path / "a.jsonl").read_text().splitlines()
+    (tmp_path / "b.jsonl").write_text("\n".join(lines[:4]) + '\n{"game": 3, "sco')
+    b = run_search_eval(**eval_args(checkpoint, tmp_path / "b.jsonl"))
+    assert b["results"] == a["results"]
+    games = [json.loads(line)["game"] for line in (tmp_path / "b.jsonl").read_text().splitlines()[1:]]
+    assert sorted(games) == list(range(6))
+
+
+def test_resume_rejects_other_settings(checkpoint, tmp_path):
+    run_search_eval(**eval_args(checkpoint, tmp_path / "a.jsonl"))
+    other = tmp_path / "other.ntw"
+    other.write_bytes(checkpoint.read_bytes())
+    for change in ({"seed": 5}, {"max_moves": 151}, {"tiers": [(INF, [3])]}, {"checkpoint": other}):
+        kwargs = {"checkpoint": checkpoint} | change
+        with pytest.raises(SystemExit, match="other settings"):
+            run_search_eval(**eval_args(games_file=tmp_path / "a.jsonl", **kwargs))
+
+
+def test_summary_works_with_scripts(checkpoint, tmp_path, capsys):
+    main(["evaluate", "--weights", str(checkpoint), "--games", "4", "--seed", "1", "--max-moves", "100",
+          "--threads", "2", "--search-k", "2", "--games-file", str(tmp_path / "g.jsonl"), "--json"])  # fmt: skip
+    out = json.loads(capsys.readouterr().out)
+    assert out["games"] == 4 and len(out["results"]) == 4
+    assert out["search"]["tiers"] == [[None, [2]]] and out["search"]["us_per_move"] > 0
+    (tmp_path / "s.json").write_text(json.dumps(out))
+    root = Path(__file__).parent.parent
+    for script, arg in (("bootstrap_mean.py", [tmp_path / "s.json"] * 2), ("ab_compare.py", [tmp_path / "c.jsonl"])):
+        (tmp_path / "c.jsonl").write_text(json.dumps({k: v for k, v in out.items() if k != "results"} | {"arm": "x"}) + "\n")
+        subprocess.run([sys.executable, root / "scripts" / script, *arg], check=True, capture_output=True)
+
+
+def test_evaluate_cli_without_search_unchanged(checkpoint, capsys):
+    main(["evaluate", "--weights", str(checkpoint), "--games", "4", "--seed", "1", "--max-moves", "100", "--threads", "2",
+          "--json"])  # fmt: skip
+    out = json.loads(capsys.readouterr().out)
+    model = load_model(checkpoint)[0]
+    expected = _engine.evaluate_ntuple(model, 4, 1, 100, 2, 0.999)
+    assert [(r["score"], r["moves"]) for r in out["results"]] == [(r[0], r[1]) for r in expected]
+    assert "search" not in out
