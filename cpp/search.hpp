@@ -79,23 +79,25 @@ inline void root_moves(const NTuple& nt, const State& s, float gamma, std::vecto
     const Tables& t = nt.tables();
     const bool cooldown = in_cooldown(t, s.history);
     out.clear();
+    const BoardParts parts = nt.parts(s.board);
     for (int slot = 0; slot < 3; slot++) {
         const int piece = s.pending[slot];
         const int r0 = s.pending[slot == 0 ? 1 : 0], r1 = s.pending[slot == 2 ? 1 : 2];
-        for_each_bit(legal_positions(t, s.board, piece), [&](int pos) {
+        for_each_bit(parts.legal[piece], [&](int pos) {
             const Placed p = apply(t, s.board, piece, pos);
-            const double v = nt.value(nt.board_eval(p.board), cooldown, r0, r1);
+            const double v = nt.value(nt.child_eval(parts, piece, pos, p), cooldown, r0, r1);
             out.push_back({slot, pos, p.points, p.board, r0, r1, v, p.points + gamma * v});
         });
     }
 }
 
-inline void known_placements(const NTuple& nt, Board board, int piece, int other, std::vector<Known>& out) {
+inline void known_placements(const NTuple& nt, Board board, const BoardParts& parts, int piece, int other,
+                             std::vector<Known>& out) {
     const Tables& t = nt.tables();
     out.clear();
-    for_each_bit(legal_positions(t, board, piece), [&](int pos) {
+    for_each_bit(parts.legal[piece], [&](int pos) {
         const Placed p = apply(t, board, piece, pos);
-        Known k{pos, p.points, p.board, nt.board_eval(p.board), {}};
+        Known k{pos, p.points, p.board, nt.child_eval(parts, piece, pos, p), {}};
         const float w = nt.rem_weight(k.e, other);
         for (int cd = 0; cd < 2; cd++) {
             double v = nt.fit_prefix(k.e, cd);
@@ -106,12 +108,12 @@ inline void known_placements(const NTuple& nt, Board board, int piece, int other
     });
 }
 
-// The moves of the child with board ``board`` and pending (rem0, rem1, x), in engine order, as emit(Cand).
-// k0 and k1 hold the placements of rem0 and rem1; with skip_slot1 the slot-1 moves are left out (they
-// repeat slot 0 when rem0 == rem1, which only a max may ignore).
+// The moves of the child with board ``board`` (parts: nt.parts(board)) and pending (rem0, rem1, x), in engine
+// order, as emit(Cand). k0 and k1 hold the placements of rem0 and rem1; with skip_slot1 the slot-1 moves are left
+// out (they repeat slot 0 when rem0 == rem1, which only a max may ignore).
 template <class F>
-inline void child_moves(const NTuple& nt, Board board, int rem0, int rem1, int x, bool cooldown, float gamma,
-                        const std::vector<Known>& k0, const std::vector<Known>& k1, bool skip_slot1, F&& emit) {
+inline void child_moves(const NTuple& nt, Board board, const BoardParts& parts, int rem0, int rem1, int x, bool cooldown,
+                        float gamma, const std::vector<Known>& k0, const std::vector<Known>& k1, bool skip_slot1, F&& emit) {
     for (const Known& k : k0) {
         double v = k.pre[cooldown];
         v += nt.rem_weight(k.e, x);
@@ -125,9 +127,9 @@ inline void child_moves(const NTuple& nt, Board board, int rem0, int rem1, int x
         }
     }
     const Tables& t = nt.tables();
-    for_each_bit(legal_positions(t, board, x), [&](int pos) {
+    for_each_bit(parts.legal[x], [&](int pos) {
         const Placed p = apply(t, board, x, pos);
-        const double v = nt.value(nt.board_eval(p.board), cooldown, rem0, rem1);
+        const double v = nt.value(nt.child_eval(parts, x, pos, p), cooldown, rem0, rem1);
         emit(Cand{2, pos, p.points, p.board, rem0, rem1, v, p.points + gamma * v});
     });
 }
@@ -150,9 +152,10 @@ inline double expectation(const NTuple& nt, Board after, int rem0, int rem1, int
     spawn_distribution(t, parent_score, parent_history, p);
     const bool last = widths.empty();
     const bool skip_slot1 = last && rem0 == rem1;
+    const BoardParts parts = nt.parts(after);
     std::vector<Known> k0, k1;
-    known_placements(nt, after, rem0, rem1, k0);
-    if (!skip_slot1) known_placements(nt, after, rem1, rem0, k1);
+    known_placements(nt, after, parts, rem0, rem1, k0);
+    if (!skip_slot1) known_placements(nt, after, parts, rem1, rem0, k1);
     const int64_t score = parent_score + points;
     std::vector<Cand> moves;
     double total = 0;
@@ -163,12 +166,13 @@ inline double expectation(const NTuple& nt, Board after, int rem0, int rem1, int
         double b = 0;  // B(child): 0 when the child has no legal move
         if (last) {
             bool found = false;
-            child_moves(nt, after, rem0, rem1, x, cooldown, gamma, k0, k1, skip_slot1, [&](const Cand& c) {
+            child_moves(nt, after, parts, rem0, rem1, x, cooldown, gamma, k0, k1, skip_slot1, [&](const Cand& c) {
                 if (!found || c.q1 > b) b = c.q1, found = true;
             });
         } else {
             moves.clear();
-            child_moves(nt, after, rem0, rem1, x, cooldown, gamma, k0, k1, false, [&](const Cand& c) { moves.push_back(c); });
+            child_moves(nt, after, parts, rem0, rem1, x, cooldown, gamma, k0, k1, false,
+                        [&](const Cand& c) { moves.push_back(c); });
             bool found = false;
             for (const int i : top_k(moves, widths[0])) {
                 const Cand& c = moves[i];

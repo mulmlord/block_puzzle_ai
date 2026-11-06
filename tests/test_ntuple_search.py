@@ -167,6 +167,30 @@ def test_depth3_matches_reference():
     check_against_reference(model, mid_game_states([11])[0], [2, 2])
 
 
+def test_q1_exact_for_every_piece_and_board():
+    """The search evaluates a child from its parent's lookups when no line clears (NTuple::child_eval): root Q1
+    must equal value() of the after-state bit for bit, for every piece, on boards from empty to nearly full."""
+    _, model = random_model()
+    rng = random.Random(7)
+    pieces = all_pieces()
+    clears = plain = 0
+    for density in (0.0, 0.2, 0.4, 0.6, 0.75):
+        for _ in range(3):
+            board = sum(1 << c for c in range(100) if rng.random() < density)
+            for first in range(0, len(pieces), 3):
+                pending = [(first + i) % len(pieces) for i in range(3)]
+                state = (board, pending, rng.randrange(30_000), [rng.choice([-1, 0, 5, 8, 10]), -1, -1])
+                q = ref_q1(model, G, *state)
+                got = scores(model, state, [0])
+                assert [(s, p, pts, q1) for s, p, pts, q1, _ in got] == [(m[0], m[1], m[2], m[5]) for m in q]
+                for m in q:
+                    if bin(m[3]).count("1") < bin(board).count("1") + len(pieces[pending[m[0]]].cells):
+                        clears += 1
+                    else:
+                        plain += 1
+    assert clears > 100 and plain > 1000
+
+
 def test_search_move_picks_max_and_tiers():
     _, model = random_model()
     for state in mid_game_states()[:5]:
