@@ -1,9 +1,11 @@
 // Python bindings: block_puzzle_ai._engine (wrapped by block_puzzle_ai.engine)
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
+#include <nanobind/stl/optional.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
 
+#include <optional>
 #include <stdexcept>
 #include <tuple>
 #include <variant>
@@ -12,6 +14,7 @@
 #include "engine.hpp"
 #include "ntuple.hpp"
 #include "rng.hpp"
+#include "search.hpp"
 
 namespace nb = nanobind;
 using bpa::Tables;
@@ -37,6 +40,30 @@ int64_t check_score(int64_t score) {
     return score;
 }
 
+// A state as passed from Python; moves and lines start at 0.
+bpa::State make_state(const Tables& t, uint64_t lo, uint64_t hi, const std::vector<int>& pending, int64_t score,
+                      const std::vector<int>& history) {
+    if (hi >> (bpa::CELLS - 64)) throw std::invalid_argument("board has bits beyond cell 99");
+    if (pending.size() != 3) throw std::invalid_argument("pending must have 3 piece ids");
+    for (int p : pending)
+        if (p < 0 || p >= t.n_pieces) throw std::invalid_argument("pending piece id out of range");
+    bpa::State s;
+    read_history(t, history, s.history);
+    s.board = static_cast<bpa::Board>(hi) << 64 | lo;
+    std::copy(pending.begin(), pending.end(), s.pending);
+    s.score = check_score(score);
+    return s;
+}
+
+using PyTiers = std::vector<std::tuple<double, std::vector<int>>>;  // (below, widths); below may be inf
+
+std::vector<bpa::Tier> read_tiers(const PyTiers& tiers) {
+    std::vector<bpa::Tier> out;
+    for (const auto& [below, widths] : tiers) out.push_back({below, widths});
+    bpa::check_tiers(out);
+    return out;
+}
+
 // One game with its own tables and random source (PyRandom replays game.Game(seed) exactly).
 class Game {
 public:
@@ -54,16 +81,7 @@ public:
     }
 
     void set_state(uint64_t lo, uint64_t hi, const std::vector<int>& pending, int64_t score, const std::vector<int>& history) {
-        if (hi >> (bpa::CELLS - 64)) throw std::invalid_argument("board has bits beyond cell 99");
-        if (pending.size() != 3) throw std::invalid_argument("pending must have 3 piece ids");
-        for (int p : pending)
-            if (p < 0 || p >= t_.n_pieces) throw std::invalid_argument("pending piece id out of range");
-        bpa::State s;
-        read_history(t_, history, s.history);
-        s.board = static_cast<bpa::Board>(hi) << 64 | lo;
-        std::copy(pending.begin(), pending.end(), s.pending);
-        s.score = check_score(score);
-        s_ = s;
+        s_ = make_state(t_, lo, hi, pending, score, history);
     }
 
     std::tuple<int, int, bool> step(int slot, int row, int col) {
@@ -233,6 +251,46 @@ NB_MODULE(_engine, m) {
         },
         nb::arg("ntuple"), nb::arg("games"), nb::arg("seed"), nb::arg("max_moves"), nb::arg("threads"),
         nb::arg("gamma") = 1.0f, "greedy 1-ply games -> (score, moves, lines, truncated) per game, in game order");
+
+    m.def(
+        "search_scores",
+        [](const bpa::NTuple& nt, uint64_t lo, uint64_t hi, const std::vector<int>& pending, int64_t score,
+           const std::vector<int>& history, float gamma, const std::vector<int>& widths) {
+            const bpa::State s = make_state(nt.tables(), lo, hi, pending, score, history);
+            bpa::check_widths(widths);
+            std::vector<bpa::Scored> res;
+            {
+                nb::gil_scoped_release release;
+                res = bpa::search_scores(nt, s, gamma, widths);
+            }
+            std::vector<std::tuple<int, int, int, double, double>> out;
+            for (const auto& r : res) out.emplace_back(r.slot, r.pos, r.points, r.q1, r.score);
+            return out;
+        },
+        nb::arg("ntuple"), nb::arg("board_lo"), nb::arg("board_hi"), nb::arg("pending"), nb::arg("score"),
+        nb::arg("history"), nb::arg("gamma"), nb::arg("widths"),
+        "kept root moves (top widths[0] by Q1) in engine order -> (slot, pos, points, q1, search score)");
+
+    m.def(
+        "search_move",
+        [](const bpa::NTuple& nt, uint64_t lo, uint64_t hi, const std::vector<int>& pending, int64_t score,
+           const std::vector<int>& history, float gamma,
+           const PyTiers& tiers) -> std::optional<std::tuple<int, int, double, int, bool>> {
+            const bpa::State s = make_state(nt.tables(), lo, hi, pending, score, history);
+            const std::vector<bpa::Tier> t = read_tiers(tiers);
+            bpa::Choice c;
+            int tier = -1;
+            bool changed = false, found;
+            {
+                nb::gil_scoped_release release;
+                found = bpa::search_move(nt, s, gamma, t, c, tier, changed);
+            }
+            if (!found) return std::nullopt;
+            return std::make_tuple(c.slot, c.pos, c.q, tier, changed);
+        },
+        nb::arg("ntuple"), nb::arg("board_lo"), nb::arg("board_hi"), nb::arg("pending"), nb::arg("score"),
+        nb::arg("history"), nb::arg("gamma"), nb::arg("tiers"),
+        "searched move -> (slot, pos, q, tier, changed), or None with no legal move; tier -1 = 1-ply");
 
     m.def(
         "random_play",

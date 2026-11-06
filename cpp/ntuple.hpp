@@ -146,13 +146,22 @@ public:
         return e;
     }
 
-    // V from a board's BoardEval: the same lookups and summation order as value(Afterstate), so bit-identical.
-    double value(const BoardEval& e, bool cooldown, int rem0, int rem1) const {
+    // The tuple sum plus the fit weights: the part of V shared by every remaining pair.
+    double fit_prefix(const BoardEval& e, bool cooldown) const {
         double v = e.tuples;
         const int base = fit_offset_ + (cooldown ? t_.n_groups : 0) * FIT_BUCKETS;
         for (int g = 0; g < t_.n_groups; g++) v += load(base + g * FIT_BUCKETS + fit_bucket(e.group_count[g]));
-        v += load(rem_index(rem0, e.count));
-        v += load(rem_index(rem1, e.count));
+        return v;
+    }
+
+    float rem_weight(const BoardEval& e, int piece) const { return load(rem_index(piece, e.count)); }
+
+    // V from a board's BoardEval: the same lookups and summation order as value(Afterstate), so bit-identical.
+    // Callers that add the remaining weights to fit_prefix one at a time, in this order, get the same double.
+    double value(const BoardEval& e, bool cooldown, int rem0, int rem1) const {
+        double v = fit_prefix(e, cooldown);
+        v += rem_weight(e, rem0);
+        v += rem_weight(e, rem1);
         return v;
     }
 
