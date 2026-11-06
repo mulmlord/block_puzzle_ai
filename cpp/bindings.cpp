@@ -293,6 +293,38 @@ NB_MODULE(_engine, m) {
         "searched move -> (slot, pos, q, tier, changed), or None with no legal move; tier -1 = 1-ply");
 
     m.def(
+        "evaluate_ntuple_search",
+        [](const bpa::NTuple& nt, int games, uint64_t seed, int64_t max_moves, int threads, float gamma, const PyTiers& tiers,
+           const std::vector<int>& skip, nb::object on_game) {
+            using Row = std::tuple<int, int64_t, int64_t, int64_t, bool, std::vector<uint64_t>, std::vector<uint64_t>, double,
+                                   std::vector<double>>;
+            auto row = [](int g, const bpa::GameSearch& r) {
+                return Row{g, r.outcome.score, r.outcome.moves, r.outcome.lines, r.outcome.truncated, r.searched, r.changed,
+                           r.seconds, r.last_q1};
+            };
+            const std::vector<bpa::Tier> t = read_tiers(tiers);
+            std::function<void(int, const bpa::GameSearch&)> callback;
+            if (!on_game.is_none()) {
+                callback = [&](int g, const bpa::GameSearch& r) {
+                    nb::gil_scoped_acquire acquire;
+                    std::apply([&](auto&&... a) { on_game(a...); }, row(g, r));
+                };
+            }
+            std::vector<std::pair<int, bpa::GameSearch>> res;
+            {
+                nb::gil_scoped_release release;
+                res = bpa::evaluate_search(nt, games, seed, max_moves, threads, gamma, t, skip, callback);
+            }
+            std::vector<Row> out;
+            for (const auto& [g, r] : res) out.push_back(row(g, r));
+            return out;
+        },
+        nb::arg("ntuple"), nb::arg("games"), nb::arg("seed"), nb::arg("max_moves"), nb::arg("threads"), nb::arg("gamma"),
+        nb::arg("tiers"), nb::arg("skip"), nb::arg("on_game").none(),
+        "searched games -> (game, score, moves, lines, truncated, searched, changed, seconds, last_q1) per game played, in "
+        "game order; on_game(*row) is called as each game finishes");
+
+    m.def(
         "random_play",
         [](const Tables& t, int threads, uint64_t moves_per_thread, uint64_t seed) {
             const bpa::PlayStats st = bpa::play_random(t, threads, moves_per_thread, seed, false);

@@ -4,7 +4,9 @@ Spec: docs/superpowers/specs/2026-11-05-ntuple-search-design.md, section "Search
 """
 
 import json
+import math
 import random
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -13,10 +15,12 @@ import pytest
 
 from block_puzzle_ai import _engine
 from block_puzzle_ai.engine import CppGame
-from block_puzzle_ai.ntuple import make_model, shapes_to_tuples, value
+from block_puzzle_ai.game import Move
+from block_puzzle_ai.ntuple import load_model, make_model, shapes_to_tuples, value
 from block_puzzle_ai.pieces import HARD_GROUPS, all_pieces
 
 DATA = Path(__file__).parent / "data"
+MODELS = Path(__file__).parent.parent / "models"
 
 
 def random_model():
@@ -213,3 +217,103 @@ def test_tiers_rejected(tiers):
     if len(tiers) == 1 and tiers[0][1] != [4]:
         with pytest.raises(ValueError):
             scores(model, state, tiers[0][1])
+
+
+# ---- evaluate_search -------------------------------------------------------------------------------------
+
+
+def run_search(model, games, seed, max_moves, threads, tiers, skip=(), on_game=None, gamma=G):
+    return _engine.evaluate_ntuple_search(model, games, seed, max_moves, threads, gamma, tiers, list(skip), on_game)
+
+
+def test_no_tiers_matches_evaluate():
+    _, model = random_model()
+    got = run_search(model, 24, 5, 50, 8, [])
+    expected = _engine.evaluate_ntuple(model, 24, 5, 50, 8, G)
+    assert [r[0] for r in got] == list(range(24))
+    assert [r[1:5] for r in got] == expected
+    assert any(r[3] for r in expected) and not all(r[3] for r in expected)  # some games hit the cap, some die first
+    assert all(r[5] == [] and r[6] == [] for r in got)
+
+
+def test_search_threads_independent():
+    _, model = random_model()
+    one = run_search(model, 8, 3, 200, 1, [(INF, [2])])
+    eight = run_search(model, 8, 3, 200, 8, [(INF, [2])])
+    strip = [[*r[:7], r[8]] for r in one]
+    assert strip == [[*r[:7], r[8]] for r in eight]
+    assert all(r[5][0] == r[2] for r in one)  # every move searched
+    assert sum(r[6][0] for r in one) > 0
+
+
+def test_skip_and_callback():
+    _, model = random_model()
+    tiers = [(INF, [2]), (50.0, [4])]
+    full = run_search(model, 6, 9, 100, 3, tiers)
+    calls = []
+    part = run_search(model, 6, 9, 100, 3, tiers, skip=[1, 4], on_game=lambda *row: calls.append(row))
+    assert [r[0] for r in part] == [0, 2, 3, 5]
+    assert [r[:7] + r[8:] for r in part] == [r[:7] + r[8:] for r in full if r[0] in (0, 2, 3, 5)]
+    assert sorted(calls) == sorted(part)
+
+
+def test_callback_exception_stops():
+    """The first finished game raises in the callback; the other games, which may run for millions of moves,
+    stop at their next move, and the callback is not called again."""
+    model = load_model(MODELS / "ntuple_v1.ntw")[0]
+    calls = []
+
+    def boom(*row):
+        calls.append(row)
+        raise RuntimeError("boom")
+
+    t0 = time.perf_counter()
+    with pytest.raises(RuntimeError, match="boom"):
+        run_search(model, 16, 0, 10**9, 8, [], on_game=boom)
+    assert len(calls) == 1 and time.perf_counter() - t0 < 5  # 0.3 s; without the per-move stop check, 9 s
+
+
+def test_divergence_raises():
+    _, model = random_model()
+    model.weights[:] = np.nan
+    with pytest.raises(RuntimeError, match="diverged"):
+        run_search(model, 4, 0, 100, 2, [(INF, [2])])
+
+
+def test_last_q1():
+    _, model = random_model()
+    for r in run_search(model, 6, 1, 5, 2, [(INF, [2])]):
+        assert len(r[8]) == 5 and r[2] == 5
+    games = run_search(model, 6, 1, 300, 2, [(INF, [2])])
+    assert all(r[2] >= 20 for r in games)
+    for r in games:
+        assert len(r[8]) == 20 and all(math.isfinite(q) for q in r[8])
+
+
+def stream_seed(seed, g):
+    """stream_seeds(seed, n)[g]: the (g + 1)-th splitmix64 output from ``seed``."""
+    mask = (1 << 64) - 1
+    for _ in range(g + 1):
+        seed = (seed + 0x9E3779B97F4A7C15) & mask
+        z = seed
+        z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & mask
+        z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & mask
+        out = z ^ (z >> 31)
+    return out
+
+
+def test_game_replays_with_search_move():
+    """Game g of evaluate_search is search_move played on CppGame(stream_seed(seed, g), fast_rng=True); last_q1 holds
+    the best Q1 of the last 20 moves played."""
+    _, model = random_model()
+    tiers = [(INF, [2]), (60.0, [3])]
+    for g, score, moves, lines, truncated, searched, changed, _, last_q1 in run_search(model, 3, 11, 10**6, 3, tiers):
+        game, best_q1, used = CppGame(stream_seed(11, g), fast_rng=True), [], [0, 0]
+        while not game.done:
+            state = snapshot(game)
+            best_q1.append(max(m[5] for m in ref_q1(model, G, *state)))
+            slot, pos, _, tier, _ = move(model, state, tiers)
+            used[tier] += 1
+            game.step(Move(slot, pos // 10, pos % 10))
+        assert (game.score, game.moves, game.lines_cleared, False) == (score, moves, lines, truncated)
+        assert used == searched and last_q1 == best_q1[-20:]

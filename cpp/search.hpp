@@ -10,11 +10,17 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
 #include <cmath>
+#include <functional>
 #include <limits>
+#include <mutex>
 #include <numeric>
 #include <span>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 #include "engine.hpp"
@@ -204,10 +210,10 @@ inline std::vector<Scored> search_scores(const NTuple& nt, const State& s, float
 // The searched move: the last tier whose below exceeds the root's best Q1 picks the widths, and the kept move
 // with the highest search score is played (first in engine order on ties). With no such tier it plays
 // best_move's move, bit for bit. tier is the index used (-1: 1-ply); changed says the move differs from
-// best_move's. out.q is the search score (Q1 at tier -1); out.after and out.v are the chosen move's.
-// Returns false with no legal move. Tiers must pass check_tiers.
+// best_move's. out.q is the search score (Q1 at tier -1); out.after and out.v are the chosen move's; best_q1,
+// if given, receives the root's best Q1. Returns false with no legal move. Tiers must pass check_tiers.
 inline bool search_move(const NTuple& nt, const State& s, float gamma, const std::vector<Tier>& tiers, Choice& out,
-                        int& tier, bool& changed) {
+                        int& tier, bool& changed, double* best_q1 = nullptr) {
     using namespace search_detail;
     std::vector<Cand> root;
     root_moves(nt, s, gamma, root);
@@ -215,6 +221,7 @@ inline bool search_move(const NTuple& nt, const State& s, float gamma, const std
     int one = 0;  // best_move's choice: the first maximum of Q1
     for (int i = 1; i < static_cast<int>(root.size()); i++)
         if (root[i].q1 > root[one].q1) one = i;
+    if (best_q1) *best_q1 = root[one].q1;
     tier = -1;
     for (int i = static_cast<int>(tiers.size()) - 1; i >= 0; i--) {
         if (tiers[i].below > root[one].q1) {
@@ -241,6 +248,85 @@ inline bool search_move(const NTuple& nt, const State& s, float gamma, const std
     out.v = c.v, out.q = q;
     changed = pick != one;
     return true;
+}
+
+// ---- evaluation ---------------------------------------------------------------------------------
+
+struct GameSearch {
+    GameOutcome outcome;
+    std::vector<uint64_t> searched, changed;  // moves per tier that used it / where it changed the 1-ply move
+    double seconds = 0;
+    std::vector<double> last_q1;  // the root's best Q1 of the last <= 20 moves played, oldest first
+};
+
+// Searched games, scheduled, seeded and capped like evaluate(): game g uses stream_seeds(seed, games)[g], and a game
+// is truncated when it has a legal move at max_moves. Games listed in ``skip`` are not played. on_game(g, result)
+// runs once per finished game, under a mutex. An exception in a worker or in on_game stops every game before its
+// next move and is rethrown. Returns the games played, in game order.
+inline std::vector<std::pair<int, GameSearch>> evaluate_search(const NTuple& nt, int games, uint64_t seed, int64_t max_moves,
+                                                               int threads, float gamma, const std::vector<Tier>& tiers,
+                                                               const std::vector<int>& skip,
+                                                               const std::function<void(int, const GameSearch&)>& on_game) {
+    if (threads < 1) throw std::invalid_argument("threads must be >= 1");
+    if (games < 0) throw std::invalid_argument("games must be >= 0");
+    check_tiers(tiers);
+    std::vector<char> skipped(games, 0);
+    for (const int g : skip) {
+        if (g < 0 || g >= games) throw std::invalid_argument("skip: game index out of range");
+        skipped[g] = 1;
+    }
+    std::vector<std::pair<int, GameSearch>> out;
+    for (int g = 0; g < games; g++)
+        if (!skipped[g]) out.push_back({g, {}});
+    const std::vector<uint64_t> seeds = stream_seeds(seed, games);
+    const Tables& t = nt.tables();
+    std::atomic<size_t> next{0};
+    std::atomic<bool> stop{false};
+    std::mutex m;
+    parallel(threads, [&](int) {
+        try {
+            for (size_t i; (i = next.fetch_add(1)) < out.size();) {
+                const auto start = std::chrono::steady_clock::now();
+                const int g = out[i].first;
+                GameSearch r;
+                r.searched.assign(tiers.size(), 0);
+                r.changed.assign(tiers.size(), 0);
+                std::array<double, 20> ring;
+                size_t played = 0;
+                Xoshiro256 rng(seeds[g]);
+                State s;
+                reset(t, s, rng);
+                Choice c;
+                int tier;
+                bool changed, truncated = false;
+                double q1;
+                for (;;) {
+                    if (stop.load(std::memory_order_relaxed)) return;
+                    if (s.moves >= max_moves) {  // checked first, so the move at the cap is not searched
+                        truncated = has_legal_move(t, s);
+                        break;
+                    }
+                    if (!search_move(nt, s, gamma, tiers, c, tier, changed, &q1)) break;
+                    check_finite(c.q);
+                    if (tier >= 0) r.searched[tier]++, r.changed[tier] += changed;
+                    ring[played++ % ring.size()] = q1;
+                    step(t, s, c.slot, c.pos, rng);
+                }
+                for (size_t k = played > ring.size() ? played - ring.size() : 0; k < played; k++)
+                    r.last_q1.push_back(ring[k % ring.size()]);
+                r.outcome = {s.score, s.moves, s.lines, truncated};
+                r.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+                out[i].second = std::move(r);
+                std::lock_guard lock(m);
+                if (stop.load()) return;
+                if (on_game) on_game(g, out[i].second);
+            }
+        } catch (...) {
+            stop.store(true);
+            throw;
+        }
+    });
+    return out;
 }
 
 }  // namespace bpa
