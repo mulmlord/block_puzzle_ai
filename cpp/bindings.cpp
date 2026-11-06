@@ -1,15 +1,20 @@
 // Python bindings: block_puzzle_ai._engine (wrapped by block_puzzle_ai.engine)
 #include <nanobind/nanobind.h>
+#include <nanobind/ndarray.h>
+#include <nanobind/stl/optional.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
 
+#include <optional>
 #include <stdexcept>
 #include <tuple>
 #include <variant>
 #include <vector>
 
 #include "engine.hpp"
+#include "ntuple.hpp"
 #include "rng.hpp"
+#include "search.hpp"
 
 namespace nb = nanobind;
 using bpa::Tables;
@@ -35,6 +40,30 @@ int64_t check_score(int64_t score) {
     return score;
 }
 
+// A state as passed from Python; moves and lines start at 0.
+bpa::State make_state(const Tables& t, uint64_t lo, uint64_t hi, const std::vector<int>& pending, int64_t score,
+                      const std::vector<int>& history) {
+    if (hi >> (bpa::CELLS - 64)) throw std::invalid_argument("board has bits beyond cell 99");
+    if (pending.size() != 3) throw std::invalid_argument("pending must have 3 piece ids");
+    for (int p : pending)
+        if (p < 0 || p >= t.n_pieces) throw std::invalid_argument("pending piece id out of range");
+    bpa::State s;
+    read_history(t, history, s.history);
+    s.board = static_cast<bpa::Board>(hi) << 64 | lo;
+    std::copy(pending.begin(), pending.end(), s.pending);
+    s.score = check_score(score);
+    return s;
+}
+
+using PyTiers = std::vector<std::tuple<double, std::vector<int>>>;  // (below, widths); below may be inf
+
+std::vector<bpa::Tier> read_tiers(const PyTiers& tiers) {
+    std::vector<bpa::Tier> out;
+    for (const auto& [below, widths] : tiers) out.push_back({below, widths});
+    bpa::check_tiers(out);
+    return out;
+}
+
 // One game with its own tables and random source (PyRandom replays game.Game(seed) exactly).
 class Game {
 public:
@@ -52,16 +81,7 @@ public:
     }
 
     void set_state(uint64_t lo, uint64_t hi, const std::vector<int>& pending, int64_t score, const std::vector<int>& history) {
-        if (hi >> (bpa::CELLS - 64)) throw std::invalid_argument("board has bits beyond cell 99");
-        if (pending.size() != 3) throw std::invalid_argument("pending must have 3 piece ids");
-        for (int p : pending)
-            if (p < 0 || p >= t_.n_pieces) throw std::invalid_argument("pending piece id out of range");
-        bpa::State s;
-        read_history(t_, history, s.history);
-        s.board = static_cast<bpa::Board>(hi) << 64 | lo;
-        std::copy(pending.begin(), pending.end(), s.pending);
-        s.score = check_score(score);
-        s_ = s;
+        s_ = make_state(t_, lo, hi, pending, score, history);
     }
 
     std::tuple<int, int, bool> step(int slot, int row, int col) {
@@ -113,6 +133,19 @@ private:
     std::variant<bpa::PyRandom, bpa::Xoshiro256> rng_{std::in_place_type<bpa::Xoshiro256>, 0};
 };
 
+bpa::Afterstate make_afterstate(const Tables& t, uint64_t lo, uint64_t hi, const std::vector<int>& remaining, bool cooldown) {
+    if (hi >> (bpa::CELLS - 64)) throw std::invalid_argument("board has bits beyond cell 99");
+    if (remaining.size() != 2) throw std::invalid_argument("remaining must hold 2 piece ids");
+    bpa::Afterstate a;
+    a.board = static_cast<bpa::Board>(hi) << 64 | lo;
+    for (int i = 0; i < 2; i++) {
+        if (remaining[i] < 0 || remaining[i] >= t.n_pieces) throw std::invalid_argument("remaining piece id out of range");
+        a.remaining[i] = remaining[i];
+    }
+    a.cooldown = cooldown;
+    return a;
+}
+
 }  // namespace
 
 NB_MODULE(_engine, m) {
@@ -159,6 +192,141 @@ NB_MODULE(_engine, m) {
         .def_prop_ro("moves", &Game::moves)
         .def_prop_ro("lines_cleared", &Game::lines)
         .def_prop_ro("done", &Game::done);
+
+    nb::class_<bpa::NTuple>(m, "NTuple", "n-tuple after-state value function over shared float32 weights")
+        .def(nb::init<const Tables&, std::vector<std::vector<int>>>(), nb::arg("tables"), nb::arg("tuples"))
+        .def_prop_ro("n_weights", &bpa::NTuple::n_weights)
+        .def_prop_ro("n_lookups", &bpa::NTuple::n_lookups)
+        .def_prop_ro("tuples", &bpa::NTuple::tuples)
+        .def_prop_ro(
+            "weights",
+            [](bpa::NTuple& n) {
+                return nb::ndarray<nb::numpy, float, nb::ndim<1>>(n.weights(), {n.n_weights()}, nb::handle());
+            },
+            nb::rv_policy::reference_internal, "writable float32 view of the weights (keeps the model alive)")
+        .def(
+            "value",
+            [](const bpa::NTuple& n, uint64_t lo, uint64_t hi, const std::vector<int>& remaining, bool cooldown) {
+                return n.value(make_afterstate(n.tables(), lo, hi, remaining, cooldown));
+            },
+            nb::arg("board_lo"), nb::arg("board_hi"), nb::arg("remaining"), nb::arg("cooldown"))
+        .def(
+            "update",
+            [](bpa::NTuple& n, uint64_t lo, uint64_t hi, const std::vector<int>& remaining, bool cooldown, double target,
+               float alpha) { n.update(make_afterstate(n.tables(), lo, hi, remaining, cooldown), target, alpha); },
+            nb::arg("board_lo"), nb::arg("board_hi"), nb::arg("remaining"), nb::arg("cooldown"), nb::arg("target"),
+            nb::arg("alpha"), "TD step: each looked-up weight += alpha * (target - V) / n_lookups");
+
+    nb::class_<bpa::Trainer>(m, "Trainer", "lock-free multithreaded TD(0) self-play with restarts near game overs")
+        .def(nb::init<bpa::NTuple&, float, float, double, int, uint64_t>(), nb::arg("ntuple"), nb::arg("gamma"),
+             nb::arg("alpha"), nb::arg("restart_frac"), nb::arg("threads"), nb::arg("seed"), nb::keep_alive<1, 2>())
+        .def_rw("alpha", &bpa::Trainer::alpha)
+        .def(
+            "run",
+            [](bpa::Trainer& tr, uint64_t moves) {
+                bpa::TrainStats st;
+                {
+                    nb::gil_scoped_release release;
+                    st = tr.run(moves);
+                }
+                nb::dict d;
+                d["moves"] = st.moves, d["seconds"] = st.seconds, d["games"] = st.games, d["deaths"] = st.deaths;
+                d["fresh_games"] = st.fresh_games, d["mean_score"] = st.mean_score(), d["mean_moves"] = st.mean_moves();
+                d["restarts"] = st.restarts, d["value_mean"] = st.value_mean();
+                return d;
+            },
+            nb::arg("moves"), "play this many moves in total across the threads, learning as it goes");
+
+    m.def(
+        "evaluate_ntuple",
+        [](const bpa::NTuple& nt, int games, uint64_t seed, int64_t max_moves, int threads, float gamma) {
+            std::vector<bpa::GameOutcome> res;
+            {
+                nb::gil_scoped_release release;
+                res = bpa::evaluate(nt, games, seed, max_moves, threads, gamma);
+            }
+            std::vector<std::tuple<int64_t, int64_t, int64_t, bool>> out;
+            for (const auto& r : res) out.emplace_back(r.score, r.moves, r.lines, r.truncated);
+            return out;
+        },
+        nb::arg("ntuple"), nb::arg("games"), nb::arg("seed"), nb::arg("max_moves"), nb::arg("threads"),
+        nb::arg("gamma") = 1.0f, "greedy 1-ply games -> (score, moves, lines, truncated) per game, in game order");
+
+    m.def(
+        "search_scores",
+        [](const bpa::NTuple& nt, uint64_t lo, uint64_t hi, const std::vector<int>& pending, int64_t score,
+           const std::vector<int>& history, float gamma, const std::vector<int>& widths) {
+            const bpa::State s = make_state(nt.tables(), lo, hi, pending, score, history);
+            bpa::check_widths(widths);
+            std::vector<bpa::Scored> res;
+            {
+                nb::gil_scoped_release release;
+                res = bpa::search_scores(nt, s, gamma, widths);
+            }
+            std::vector<std::tuple<int, int, int, double, double>> out;
+            for (const auto& r : res) out.emplace_back(r.slot, r.pos, r.points, r.q1, r.score);
+            return out;
+        },
+        nb::arg("ntuple"), nb::arg("board_lo"), nb::arg("board_hi"), nb::arg("pending"), nb::arg("score"),
+        nb::arg("history"), nb::arg("gamma"), nb::arg("widths"),
+        "kept root moves (top widths[0] by Q1) in engine order -> (slot, pos, points, q1, search score)");
+
+    m.def(
+        "search_move",
+        [](const bpa::NTuple& nt, uint64_t lo, uint64_t hi, const std::vector<int>& pending, int64_t score,
+           const std::vector<int>& history, float gamma,
+           const PyTiers& tiers) -> std::optional<std::tuple<int, int, double, int, bool>> {
+            const bpa::State s = make_state(nt.tables(), lo, hi, pending, score, history);
+            const std::vector<bpa::Tier> t = read_tiers(tiers);
+            bpa::Choice c;
+            int tier = -1;
+            bool changed = false, found;
+            {
+                nb::gil_scoped_release release;
+                found = bpa::search_move(nt, s, gamma, t, c, tier, changed);
+            }
+            if (!found) return std::nullopt;
+            return std::make_tuple(c.slot, c.pos, c.q, tier, changed);
+        },
+        nb::arg("ntuple"), nb::arg("board_lo"), nb::arg("board_hi"), nb::arg("pending"), nb::arg("score"),
+        nb::arg("history"), nb::arg("gamma"), nb::arg("tiers"),
+        "searched move -> (slot, pos, q, tier, changed), or None with no legal move; tier -1 = 1-ply");
+
+    m.def(
+        "check_search_tiers", [](const PyTiers& tiers) { read_tiers(tiers); }, nb::arg("tiers"),
+        "raise ValueError unless below strictly decreases, depth does not decrease and widths are >= 0");
+
+    m.def(
+        "evaluate_ntuple_search",
+        [](const bpa::NTuple& nt, int games, uint64_t seed, int64_t max_moves, int threads, float gamma, const PyTiers& tiers,
+           const std::vector<int>& skip, nb::object on_game) {
+            using Row = std::tuple<int, int64_t, int64_t, int64_t, bool, std::vector<uint64_t>, std::vector<uint64_t>, double,
+                                   std::vector<double>>;
+            auto row = [](int g, const bpa::GameSearch& r) {
+                return Row{g, r.outcome.score, r.outcome.moves, r.outcome.lines, r.outcome.truncated, r.searched, r.changed,
+                           r.seconds, r.last_q1};
+            };
+            const std::vector<bpa::Tier> t = read_tiers(tiers);
+            std::function<void(int, const bpa::GameSearch&)> callback;
+            if (!on_game.is_none()) {
+                callback = [&](int g, const bpa::GameSearch& r) {
+                    nb::gil_scoped_acquire acquire;
+                    std::apply([&](auto&&... a) { on_game(a...); }, row(g, r));
+                };
+            }
+            std::vector<std::pair<int, bpa::GameSearch>> res;
+            {
+                nb::gil_scoped_release release;
+                res = bpa::evaluate_search(nt, games, seed, max_moves, threads, gamma, t, skip, callback);
+            }
+            std::vector<Row> out;
+            for (const auto& [g, r] : res) out.push_back(row(g, r));
+            return out;
+        },
+        nb::arg("ntuple"), nb::arg("games"), nb::arg("seed"), nb::arg("max_moves"), nb::arg("threads"), nb::arg("gamma"),
+        nb::arg("tiers"), nb::arg("skip"), nb::arg("on_game").none(),
+        "searched games -> (game, score, moves, lines, truncated, searched, changed, seconds, last_q1) per game played, in "
+        "game order; on_game(*row) is called as each game finishes");
 
     m.def(
         "random_play",
