@@ -475,3 +475,44 @@ Long evaluation (64 games, seed `777`; `uv run python -m block_puzzle_ai.ntuple 
 1. **Lookahead search on the n-tuple agent.** Search added +4.65M (1.7×) to `rl_v2` and halved its death rate. Evaluation here is 48× cheaper, so deeper or ungated search is affordable. It needs no retraining.
 2. **Training stability.** Replace the guard's halving, which froze α at 1/256 after 83 minutes, with per-weight adaptive steps (temporal-coherence learning, the usual choice for 2048 n-tuple networks). Also look at why survival cycles every ~90 minutes even at tiny α. One guess is that danger states are forgotten when game overs become rare. Rollbacks need a longer window to be of any use.
 3. **Points per move.** γ was ruled out, so the features are next: tuple shapes that can represent setups for clearing several lines at once.
+
+## n-tuple search (ticket #10)
+
+Expectimax search over the n-tuple value (`cpp/search.hpp`, design in `docs/superpowers/specs/2026-11-05-ntuple-search-design.md`):
+- Each kept move is scored by `r + γ · Σ_x P(x) · best1(child)`, with the exact spawn distribution and no sampling.
+- "k" is the number of root moves kept, by 1-ply value Q1.
+- A gate searches only when the root's best Q1 is below G. Q1 is about 92.5k on ordinary moves.
+
+Weights: `models/ntuple_v1.ntw`, a copy of `runs/nt1/best.ntw` (γ 0.999).
+
+### Depth 2
+
+Command: `uv run python -m block_puzzle_ai.ntuple evaluate --weights models/ntuple_v1.ntw --games 64 --seed 2024 --max-moves 200000 --search-k K` (or `--search-below G --search-k 8`), plus `--games-file … --json`.
+
+Cost, in µs per move per thread:
+
+| k | 8 games on 8 threads | 64 games on 24 threads | × 1-ply (24 threads) |
+|---:|---:|---:|---:|
+| 1-ply | 28 | 49 | 1 |
+| 2 | 511 | 1,002 | 20 |
+| 4 | 1,017 | 1,949 | 40 |
+| 8 | 1,999 | 4,214 | 86 |
+
+Arms (64 games, seed `2024`, 200,000-move cap, 24 threads). Death rates are relative to 1-ply, with Poisson 95% CIs (`scripts/ab_compare.py`):
+
+| Arm | Searched | Changed | Mean | Median | Alive at cap | Moves / game over | Points / move | Death rate | Time |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1-ply | 0 | 0 | 5,069,704 | 3,766,075 | 1 | 54,787 | 94.0 | 1 | 11 s |
+| gate G = 90k | 0.085% | 0.041% | 12,138,866 | 12,813,315 | 21 | 192,133 | 94.0 | 0.29 [0.19, 0.42] | 22 s |
+| gate G = 92k | 0.84% | 0.40% | 16,716,380 | 18,817,385 | 46 | 631,186 | 94.2 | 0.087 [0.051, 0.147] | 37 s |
+| k = 2 | 100% | 19.9% | 18,432,223 | 19,689,075 | 58 | 1,997,181 | 98.4 | 0.027 [0.012, 0.063] | 9.4 min |
+| k = 4 | 100% | 28.7% | 19,951,879 | 20,268,075 | 63 | 12,600,958 | 101.3 | 0.004 [0.001, 0.031] | 19 min |
+| **k = 8** | 100% | 32.0% | **20,365,126** | **20,619,130** | 63 | 12,640,489 | **103.1** | 0.004 [0.001, 0.031] | 41 min |
+
+- **Search buys survival, by an order of magnitude or more.**
+  - Searching only 0.84% of moves (G = 92k) cuts the death rate 11× for 1.4× the cost of 1-ply.
+  - Searching every move with k = 2 cuts it 36× (6 game overs in 12M moves).
+  - k = 4 and k = 8 had one game over each.
+- **Every-move search raises points per move:** 94 → 98.4, 101.3 and 103.1 for k = 2, 4 and 8. Gated search does not (94.0–94.2). That answers the spec's question, but the gain is 5–10%. The mean moves through survival.
+- **The 200k cap now binds:** 58–63 of 64 games are alive at it. Means near 20M are about 200k × points per move, so they no longer rank the every-move arms. k = 8 against k = 2 is +1.93M [+0.85M, +3.11M].
+- **The plan's projection is obsolete.** It assumed about 1.06M moves per game at the 10M cap. k = 2 already gives about 2M moves per game over, so the acceptance is now bound by compute (long games), not by survival.
