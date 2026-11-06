@@ -28,14 +28,18 @@ The 20,000-move cap *understates* the RL agents: 54 of the 128 `rl_v1` games wer
 | **`rl_v2`** | **6,507,274** | **4,665,275** | **57,402** | **6,824,363** | **38,818,140** |
 | **`rl_v2` + lookahead search** | **11,158,066**\* | **7,589,755** | **117,387** | | |
 | n-tuple `runs/nt1/best.ntw` (8 h, CPU) | 6,192,662 | 4,224,940 | 72,672 | | |
+| **n-tuple + search** (`models/ntuple_v1.ntw`, 10M-move cap)† | **365,777,118** | **320,815,295** | **3,774,622** | | |
 
 \*12 of the 64 games were still alive at the cap, so this is a lower bound.
+
+†Played with a 10M-move cap instead of 200,000; 1 of the 64 games was still alive at it.
 
 - **`rl_v2`** comes from a 10-hour fine-tune of `rl_v1` (ticket #8). Its mean is 2.5× `rl_v1`'s: +3.91M, bootstrap 95% CI [+2.39M, +5.54M].
   - **High score: 38,818,140 points** in a single 331,683-move game, without search.
   - It survives about 2.4× longer and scores 117 instead of 108 points per move.
 - **Lookahead search** (`--search`) adds +4.65M [+2.13M, +7.12M] to `rl_v2`'s mean, 1.7×, and halves its death rate.
 - **n-tuple learner** (ticket #10, technique 7): 8 hours of TD(0) on the C++ engine tie `rl_v2`'s mean (−0.31M [−2.35M, +1.76M]). It survives longer but scores 94 instead of 117 points per move. One of its games scored **42,324,610**, the highest yet, with a 10M-move cap ([results](docs/RESULTS.md#8-hour-run-runsnt1)).
+- **n-tuple + expectimax search** (ticket #10): the n-tuple agent searches 2 levels deep on every move (`--search-k 2`), and 3 deep when its value drops (`--deep-below 92000 --deep-k 4,2`). That raises the mean to **365.8 million**, 3.7× the 100M goal, with 50× fewer game overs. One game scored **984,183,190** and was still alive at the 10M-move cap ([results](docs/RESULTS.md#n-tuple-search-ticket-10)).
 - See [`docs/RESULTS.md`](docs/RESULTS.md).
 - **Scoring efficiency:** the agent scores more points per move than the heuristic because it deliberately sets up multi-line clears. The game pays `50·L·(L+1)` for `L` simultaneous lines.
 

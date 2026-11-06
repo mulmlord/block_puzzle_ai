@@ -555,3 +555,42 @@ Arms: k = 2 on every move plus the tier (G₂, widths); 64 games, seed `2024`, 2
 - A 10M-move game takes about 3.2 h at the 24-thread cost.
 - All 64 games at the cap would take 8.6 h, which is over the 8-hour budget only in the case where almost no game dies.
 - Every move with k = 4 or k = 8 does not fit. k = 4 is 1,949 µs per move with about 12.6M moves per game over (1 game over), which projects to about 10 h.
+
+### Acceptance
+
+Command (2026-11-06, 04:35–08:06; 24 threads, no `tfeval` running):
+
+```bash
+uv run python -m block_puzzle_ai.ntuple evaluate --weights models/ntuple_v1.ntw --games 64 --seed 777 --max-moves 10000000 \
+  --search-k 2 --deep-below 92000 --deep-k 4,2 --games-file runs/nts_accept/games.jsonl --json
+```
+
+Seed `777`, 64 games. Death rates are relative to n-tuple 1-ply, with Poisson 95% CIs (`scripts/ab_compare.py`):
+
+| | Cap | Mean | Median | Min | Max | Moves / game over | Points / move | Alive at cap | Death rate | Time |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| n-tuple, 1-ply | 10M | 7,111,924 | 4,224,940 | 19,940 | 42,324,610 | 75,645 | 94.0 | 0 | 1 | 17 s |
+| `rl_v2` + search | 200k | 11,158,066 | 7,589,755 | | 23,464,090 | 117,387 | **117.0** | 12 | 0.64 [0.45, 0.93] | 12 min |
+| **n-tuple + search** | 10M | **365,777,118** | **320,815,295** | 5,749,560 | **984,183,190** | **3,774,622** | 98.4 | 1 | **0.020 [0.014, 0.028]** | 3.51 h |
+
+- **The 100M goal is reached:** the mean is 365.8M, 3.7× the goal. 51 of the 64 games scored over 100M.
+- **vs n-tuple 1-ply at the same cap:** +358.7M, bootstrap 95% CI [+292.7M, +426.8M]. That is 51×, almost all of it from survival: the death rate is 50× lower.
+- **vs `rl_v2` + search:** +354.6M [+288.6M, +422.9M]. Its run had a 200k cap with 12 games alive, so its mean is a lower bound.
+- **High score: 984,183,190 points** in game 0. It was still alive at the 10M-move cap.
+- **Cost:** 1,059 µs per move per thread. The depth-3 tier ran on 449k moves (0.19%) and changed the move on 49% of them; depth 2 changed 20% of all moves.
+  - The longest game (10M moves) took 2.94 h. The whole evaluation took 3.51 h of the 8-hour budget.
+- **The projection was optimistic but inside its range.** The seed-`2024` arm had 2 game overs and gave 6.33M moves per game over (95% range 1.75M–52M); seed `777` gives 3.77M from 63 game overs. The mean is 366M against a projected 495M [172M, 897M].
+
+**Verdict:** 365.8M, with 3.5 of the 8 hours used. Survival still sets the mean, and the value function is the bottleneck:
+- In 28 of the 63 game overs, the best Q1 was still ≥ 92k three moves before the end. The deep tier never fired for those: the value did not see the danger coming.
+- Points per move (98.4) are fixed by k = 2 and stay below `rl_v2`'s 117.
+
+### Next methods, in order
+
+1. **Spend the unused compute on wider search.** At seed `2024`, k = 4 on every move had 1 game over in 12.6M moves and 101 points per move, against k = 2's 6 game overs and 98.4.
+   - At the 10M cap, k = 4 projects to about 10 h. The 8-hour budget is set by the longest games, which run on one thread each.
+   - So this needs either k = 3, or searching one game on several threads once fewer games than threads are left.
+2. **A value function that sees danger.** Almost half the game overs give no warning in Q1 three moves ahead, so wider search alone cannot catch them.
+   - Options: training on search-backed targets, and the temporal-coherence step sizes from the n-tuple learner's list.
+3. **Points per move:** tuple features that represent multi-line setups, as before. `rl_v2` gets 117 per move.
+4. **The 10M cap now binds.** At this survival, about 7% of games reach it, worth about 985M points each. Comparing means at higher survival will need a higher cap, and more compute.
