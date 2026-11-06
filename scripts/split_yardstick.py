@@ -18,8 +18,8 @@ estimates q1 x p2 in one stage. Results and validation: docs/RESULTS.md, "Yardst
     uv run python scripts/split_yardstick.py roll DIR --arm A --reps 10 --seed 41 --states DIR/roll_32.json --tag _s2_A
     uv run python scripts/split_estimate.py DIR DIR/roll_32.json DIR/roll_41_s2_A.json [DIR/roll_41_s2_B.json ...]
 
-Arms are the acceptance config (k = 2 on every move, [4, 2] below 92k) with other widths on every move (k3, k4) or
-below 85k. The 75k and 65k tiers only label the Q1 band.
+Arms are the acceptance config (k = 2 on every move, [4, 2] below 92k) with other widths on every move (k3, k4),
+below 92k (k4b8, k4b16) or below 85k. The 75k and 65k tiers only label the Q1 band.
 """
 
 import argparse
@@ -37,13 +37,13 @@ from block_puzzle_ai.ntuple import load_model
 
 WEIGHTS = "models/ntuple_v1.ntw"
 INF = math.inf
-def arm(widths, k=2):
-    """k on every move, [4, 2] below 92k and ``widths`` below 85k."""
-    return [(INF, [k]), (92000.0, [4, 2]), (85000.0, widths), (75000.0, widths), (65000.0, widths)]
+def arm(widths, k=2, danger=(4, 2)):
+    """k on every move, ``danger`` below 92k and ``widths`` below 85k."""
+    return [(INF, [k]), (92000.0, list(danger)), (85000.0, widths), (75000.0, widths), (65000.0, widths)]
 
 
 ARMS = {"accept": arm([4, 2]), "d4": arm([4, 2, 2]), "w8": arm([8, 4]), "w8d4": arm([8, 4, 2]), "w6d4": arm([6, 3, 2]),
-        "k3": arm([4, 2], 3), "k4": arm([4, 2], 4)}
+        "k3": arm([4, 2], 3), "k4": arm([4, 2], 4), "k4b8": arm([8, 4], 4, (8, 4)), "k4b16": arm([16, 8], 4, (16, 8))}
 TIERS = ARMS["accept"]
 _M = {}
 

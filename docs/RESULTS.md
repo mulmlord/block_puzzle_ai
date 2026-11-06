@@ -723,9 +723,35 @@ The split yardstick for k = 3 and k = 4 on every move, each with [4, 2] below 92
   - a k = 4 search about 1.8× faster;
   - splitting one game's search across idle threads, about 5 threads for the last game.
 
+### Search below 92k on top of k = 4
+
+Two arms, each restarted from k = 4's 3,163 entry states with the same seeds and repetitions (seed `32`, 20 each) as the k = 4 capture run (2026-11-06, 21:12–22:53; `runs/yard/danger_arms.sh`, `runs/yard/split_k4`). Each arm uses its own widths both between 85k and 92k and below 85k.
+- **q1 is paired**: the same restart sees the same pieces in both arms.
+- **p2 is not paired**, because each arm falls below 85k in different states.
+- Extra cost is per move, in thread time at 24 workers, against k = 4's 1,949 µs.
+
+| Below 92k | q1 | q1 vs k = 4 (paired) | p2 | Moves / game over | Death rate vs k = 4 | Mean, no cap (full / clamped) | Extra cost / move |
+|---|---:|---:|---:|---:|---:|---|---:|
+| [4, 2] (k = 4) | 0.673% | 1 | 3.97% | 11.36M [8.08M, 17.23M] | 1 | 1,151.3M / 973.0M [759.1M, 1,235.8M] | 0 |
+| **[8, 4]** | 0.571% | **0.847 [0.753, 0.938]** | 3.80% | **14.01M [9.11M, 24.19M]** | 0.81 [0.60, 1.02] | **1,420.2M / 1,107.1M [833.0M, 1,430.5M]** | **+129 µs (+6.6%)** |
+| [16, 8] | 0.575% | 0.854 [0.731, 0.986] | 3.43% | 15.36M [8.91M, 30.72M] | 0.74 [0.48, 1.02] | 1,556.6M / 1,164.8M [819.4M, 1,551.4M] | +454 µs (+23%) |
+
+- **[8, 4] between 85k and 92k falls below 85k 15% less often.** Of the restarts that fell below 85k in either arm, 137 did only under [4, 2] and 72 only under [8, 4].
+- **[16, 8] adds nothing on q1 over [8, 4]** (1.008 [0.895, 1.144], paired), at 3.5× the cost. Its lower p2 is within the noise of unpaired states.
+- **With [8, 4], the clamped mean projects to 1.11B** (no cap), with an interval that still reaches down to 833M.
+- **The acceptance config becomes** `--search-k 4 --deep-below 92000 --deep-k 8,4`.
+
+**Cost of a 1B acceptance with k = 4 and [8, 4] below 92k** (64 games, at 2,077 µs per move per thread on 24 threads):
+
+| Cap | Moves / game | Moves, 64 games | Mean (full / clamped) | 24 threads | Longest game, 1 thread |
+|---:|---:|---:|---|---:|---:|
+| 22M | 11.10M | 710M | 1,124M / 1,107M | 17.1 h | 12.7 h |
+| 25M | 11.66M | 746M | 1,181M / 1,107M | 17.9 h | 14.4 h |
+
+- **One night needs a search about 2.1× faster**, plus about 2 threads for each of the last few games.
+
 ### Next methods, in order
 
-1. **Search between 85k and 92k on top of k = 4.** It changes q1, and paired restarts from k = 4's entry states measure that cheaply. Below 85k, search is saturated.
-2. **Speed:** profile the k = 4 search, and split one game's search across idle threads for the tail. Both are needed for a 1B acceptance in one night.
-3. **The 1B acceptance**: k = 4, cap about 22M moves, both means.
-4. **The value function**, if k = 4 is not enough. Danger shows only 1–2 moves ahead, and below 85k about 3.5% of visits are lost whatever the search does.
+1. **Speed:** profile the k = 4 search, and split one game's search across idle threads for the tail. Both are needed for a 1B acceptance in one night.
+2. **The 1B acceptance**: k = 4 with [8, 4] below 92k, cap about 22M moves, both means.
+3. **The value function**, if that is not enough. Danger shows only 1–2 moves ahead, and below 85k about 3.5% of visits are lost whatever the search does.
