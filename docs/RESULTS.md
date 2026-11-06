@@ -750,8 +750,43 @@ Two arms, each restarted from k = 4's 3,163 entry states with the same seeds and
 
 - **One night needs a search about 2.1× faster**, plus about 2 threads for each of the last few games.
 
+### Speed
+
+Profile of the k = 4 search before the changes (one thread, `perf`):
+- **Legal-placement counts** (`legal_positions` for all 28 pieces of every evaluated board): about 33%.
+- **Tuple lookups**: about 35%.
+- **The 8 board symmetries**: about 16%.
+
+95% of the evaluated boards are a parent board plus one piece, with no line cleared. `NTuple::child_eval` evaluates them from the parent's lookups:
+- The piece's images under the symmetries are translations of precomputed images.
+- Only the lookups that read the piece's cells are redone, about 34 of 120.
+- Each piece's legal positions lose one precomputed mask, shifted.
+
+The sum keeps `board_eval`'s order, so values are bit for bit the same: the golden values pass, and all benchmark scores are unchanged.
+
+Benchmark: `uv run python -m block_puzzle_ai.ntuple evaluate --weights models/ntuple_v1.ntw --games G --seed 2024 --max-moves 4000 --threads T --search-k 4 --deep-below 92000 --deep-k 8,4 --json`. Times are per move per thread, one game per thread, ±3% between runs.
+
+| Version | 1 thread | 12 threads | 24 threads | Moves per second on 24 threads |
+|---|---:|---:|---:|---:|
+| Before | 1,004 µs | 1,041 µs | 2,098 µs | 1 |
+| **Children from the parent's lookups** | 785 µs | 829 µs | **1,276 µs** | **1.65×** |
+
+- **Before, SMT added nothing**: 24 threads ran at half the per-thread speed of 12. Now the longest chain is the in-order sum of the 120 weights, and the second hyperthread fills its gaps.
+- **Idle threads join the remaining games** (`Helpers` in `cpp/search.hpp`). A searched move runs as tasks:
+  - first the part each kept root move shares;
+  - then one task per (kept move, spawned piece).
+
+  The results are the same on any number of threads. One game takes 865 µs per move on 1 thread, 258 µs on 4, and 168 µs on 12 or 24. Four games on 24 threads take 263 µs per move each.
+- **Projected acceptance time** (64 games, cap 22M, m = 14.0M; a simulation with these rates): **10.9 h [9.8, 12.1]**, against 12.6 h with one thread per game and 19.3 h before.
+
+Tried and dropped:
+- **A sum per symmetry**: 8 accumulators instead of one chain. It is +9% on 24 threads (1.30× on one), but it changes values in the last bits and breaks the golden values.
+- **Vectorized counts, and weights kept as doubles**: no gain beyond the noise.
+- **Pruning placements by an upper bound** (the largest weight over all supersets of each lookup's pattern): it prunes 0.6% of placements, so the bound is far too loose.
+- **Searching only root moves within δ of the best Q1.** The moves k = 4 picks are at most 109 below the best Q1 on 99% of moves (k = 4 changes the 1-ply move on 29% of moves). With δ = 200, the search keeps 3.87 of 4 moves on average.
+- **Incremental evaluation of line clears**: 4.6% of children clear a line, worth at most about 6%. Not done.
+
 ### Next methods, in order
 
-1. **Speed:** profile the k = 4 search, and split one game's search across idle threads for the tail. Both are needed for a 1B acceptance in one night.
-2. **The 1B acceptance**: k = 4 with [8, 4] below 92k, cap about 22M moves, both means.
-3. **The value function**, if that is not enough. Danger shows only 1–2 moves ahead, and below 85k about 3.5% of visits are lost whatever the search does.
+1. **The 1B acceptance**: `uv run python -m block_puzzle_ai.ntuple evaluate --weights models/ntuple_v1.ntw --games 64 --seed 777 --max-moves 22000000 --threads 24 --search-k 4 --deep-below 92000 --deep-k 8,4 --games-file runs/accept1b/games.jsonl --json`, with both means.
+2. **The value function**, if that is not enough. Danger shows only 1–2 moves ahead, and below 85k about 3.5% of visits are lost whatever the search does.
