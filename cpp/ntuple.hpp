@@ -34,6 +34,14 @@ struct Afterstate {
     bool cooldown = false;  // the next spawn is restricted to groups 0..7
 };
 
+// The part of V that depends only on the board: the tuple sum and the placement counts. The search reuses it
+// for every (cooldown, remaining) combination of one board (docs/superpowers/specs/2026-11-05-ntuple-search-design.md).
+struct BoardEval {
+    double tuples = 0;  // sum of the 8 * n_tuples tuple weights, from 0 in lookup order
+    int count[MAX_PIECES] = {};  // legal placements of each piece
+    int group_count[MAX_GROUPS] = {};  // summed over each group's pieces
+};
+
 // 0, 1, 2, 3-4, 5-8, 9-16, 17-32, 33+ -> 0..7
 inline int fit_bucket(int n) { return n < 3 ? n : std::min(7, std::bit_width(static_cast<unsigned>(n - 1)) + 1); }
 
@@ -126,13 +134,29 @@ public:
     const Tables& tables() const { return t_; }
     const std::vector<std::vector<int>>& tuples() const { return tuples_; }
 
-    double value(const Afterstate& a) const {
-        uint32_t idx[MAX_LOOKUPS];
-        const int n = lookups(a, idx);
-        double v = 0;
-        for (int k = 0; k < n; k++) v += load(idx[k]);
+    BoardEval board_eval(Board board) const {
+        BoardEval e;
+        Board boards[8];
+        symmetries().all(board, boards);
+        double sum = 0;  // a local: summing into e.tuples kept it in memory across the atomic loads (35% slower)
+        for (const Mask& m : masks_)
+            for (const Board b : boards) sum += load(tuple_index(m, b));
+        e.tuples = sum;
+        placement_counts(board, e.count, e.group_count);
+        return e;
+    }
+
+    // V from a board's BoardEval: the same lookups and summation order as value(Afterstate), so bit-identical.
+    double value(const BoardEval& e, bool cooldown, int rem0, int rem1) const {
+        double v = e.tuples;
+        const int base = fit_offset_ + (cooldown ? t_.n_groups : 0) * FIT_BUCKETS;
+        for (int g = 0; g < t_.n_groups; g++) v += load(base + g * FIT_BUCKETS + fit_bucket(e.group_count[g]));
+        v += load(rem_index(rem0, e.count));
+        v += load(rem_index(rem1, e.count));
         return v;
     }
+
+    double value(const Afterstate& a) const { return value(board_eval(a.board), a.cooldown, a.remaining[0], a.remaining[1]); }
 
     // TD step: every looked-up weight moves by alpha * (target - V(a)) / n_lookups.
     void update(const Afterstate& a, double target, float alpha) {
@@ -165,26 +189,36 @@ private:
         return std::atomic_ref<float>(const_cast<float&>(w_[i])).load(std::memory_order_relaxed);
     }
 
+    static uint32_t tuple_index(const Mask& m, Board b) {
+        const uint64_t lo = extract_bits(static_cast<uint64_t>(b), m.lo);
+        const uint64_t hi = extract_bits(static_cast<uint64_t>(b >> 64), m.hi);
+        return m.offset + static_cast<uint32_t>(lo | hi << m.lo_bits);
+    }
+
+    // count[p] = legal placements of piece p; group_count[g] += count[p] for p in g (zeroed by the caller)
+    void placement_counts(Board board, int* count, int* group_count) const {
+        for (int p = 0; p < t_.n_pieces; p++) {
+            const Board legal = legal_positions(t_, board, p);
+            count[p] = std::popcount(static_cast<uint64_t>(legal)) + std::popcount(static_cast<uint64_t>(legal >> 64));
+            group_count[t_.group[p]] += count[p];
+        }
+    }
+
+    uint32_t rem_index(int piece, const int* count) const {
+        return rem_offset_ + t_.group[piece] * FIT_BUCKETS + fit_bucket(count[piece]);
+    }
+
     int lookups(const Afterstate& a, uint32_t* idx) const {
         int k = 0;
         Board boards[8];
         symmetries().all(a.board, boards);
-        for (const Mask& m : masks_) {
-            for (const Board b : boards) {
-                const uint64_t lo = extract_bits(static_cast<uint64_t>(b), m.lo);
-                const uint64_t hi = extract_bits(static_cast<uint64_t>(b >> 64), m.hi);
-                idx[k++] = m.offset + static_cast<uint32_t>(lo | hi << m.lo_bits);
-            }
-        }
+        for (const Mask& m : masks_)
+            for (const Board b : boards) idx[k++] = tuple_index(m, b);
         int count[MAX_PIECES], group_count[MAX_GROUPS] = {};
-        for (int p = 0; p < t_.n_pieces; p++) {
-            const Board legal = legal_positions(t_, a.board, p);
-            count[p] = std::popcount(static_cast<uint64_t>(legal)) + std::popcount(static_cast<uint64_t>(legal >> 64));
-            group_count[t_.group[p]] += count[p];
-        }
+        placement_counts(a.board, count, group_count);
         const int base = fit_offset_ + (a.cooldown ? t_.n_groups : 0) * FIT_BUCKETS;
         for (int g = 0; g < t_.n_groups; g++) idx[k++] = base + g * FIT_BUCKETS + fit_bucket(group_count[g]);
-        for (const int p : a.remaining) idx[k++] = rem_offset_ + t_.group[p] * FIT_BUCKETS + fit_bucket(count[p]);
+        for (const int p : a.remaining) idx[k++] = rem_index(p, count);
         return k;
     }
 };
