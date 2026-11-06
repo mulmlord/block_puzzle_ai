@@ -2,10 +2,10 @@
 
 A reinforcement-learning agent for the Android game **Block Puzzle** (`game.puzzle.blockpuzzle` v6.1).
 The game rules were reverse-engineered from the shipped APK, re-implemented as a fast simulator,
-and used to train an agent that scores about **300× more than a hand-tuned heuristic**.
-- `rl_v2` averages **6.8 million** points per game on its own. Its best game of 256 scored **38.8 million**.
-- With a danger-gated lookahead search on top, it averages **12.3 million** points.
-A browser app lets you watch it play live.
+and used to train agents that score far more than a hand-tuned heuristic:
+- An **n-tuple network with expectimax search** averages **365.8 million** points per game (64 games, 10M-move cap). Its best game scored **984 million**, and the cap stopped it while it was still alive. It was trained and plays on the CPU, with the C++ engine.
+- The neural agent `rl_v2` averages **6.8 million** points per game on its own, about 300× the heuristic. Its best game of 256 scored **38.8 million**. With a danger-gated lookahead search on top, it averages **12.3 million**.
+A browser app lets you watch `rl_v2` play live.
 
 ![viewer](docs/media/viewer.gif)
 
