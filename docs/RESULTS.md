@@ -582,7 +582,8 @@ Seed `777`, 64 games. Death rates are relative to n-tuple 1-ply, with Poisson 95
 - **The projection was optimistic but inside its range.** The seed-`2024` arm had 2 game overs and gave 6.33M moves per game over (95% range 1.75M–52M); seed `777` gives 3.77M from 63 game overs. The mean is 366M against a projected 495M [172M, 897M].
 
 **Verdict:** 365.8M, with 3.5 of the 8 hours used. Survival still sets the mean, and the value function is the bottleneck:
-- In 28 of the 63 game overs, the best Q1 was still ≥ 92k three moves before the end. The deep tier never fired for those: the value did not see the danger coming.
+- In 28 of the 63 game overs, the best Q1 was still ≥ 92k three moves before the end: the value saw the danger only 1–2 moves ahead.
+  - *Correction:* this said that the deep tier never fired for those. It did: the best Q1 was below 85.2k on the last move of all 63 game overs, so the tier ran on the last move of every one, and on the last two in 22 of the 28 ([Yardstick](#yardstick-ticket-10-goal-mean-1b)).
 - Points per move (98.4) are fixed by k = 2 and stay below `rl_v2`'s 117.
 
 ### Next methods, in order
@@ -594,3 +595,137 @@ Seed `777`, 64 games. Death rates are relative to n-tuple 1-ply, with Poisson 95
    - Options: training on search-backed targets, and the temporal-coherence step sizes from the n-tuple learner's list.
 3. **Points per move:** tuple features that represent multi-line setups, as before. `rl_v2` gets 117 per move.
 4. **The 10M cap now binds.** At this survival, about 7% of games reach it, worth about 985M points each. Comparing means at higher survival will need a higher cap, and more compute.
+
+## Yardstick (ticket #10, goal: mean 1B)
+
+The next goal is a mean of 1B. At the acceptance's survival, a game over in free play costs about 4M moves, about 4 minutes of the whole machine. The precision depends only on the number of game overs D: the 95% interval on moves per game over is about ×/÷ e^(2/√D). The acceptance's 63 game overs took 3.5 hours.
+
+**Both means.** Every mean is reported twice:
+- with the simulator's full scores;
+- with each game clamped at 2³¹ − 1 = 2,147,483,647, because the game stores the score as a 32-bit int (`docs/RULES.md`, offset 0x4dc).
+
+Clamping the score is the same as capping the game at INT32_MAX / points per move: 21.8M moves at 98.4 points per move. At 98.4 points per move, a mean of 1B needs about 10.2M moves per game over with full scores, and about 12.2M with clamped scores.
+
+The engine computes the spawn level in 64 bits, so it keeps dealing hard pieces after the score passes 2³¹. In the game, the score would wrap negative there, and a negative level allows only groups 0–8 (inferred from `randTiles`, not observed).
+
+### Short capped games (`block_puzzle_ai.yardstick`)
+
+**Method.** With a constant risk per move, game lengths are exponential with mean m, the moves per game over:
+- The mean is points per move × m without a cap.
+- It is points per move × m · (1 − e^(−cap / m)) with games stopped at a cap.
+
+Many short games stopped at a cap estimate m as well as a few long games with the same number of game overs, and no single game sets the wall time.
+
+**Validation** (2026-11-06, 15:41–17:04, `runs/yard/run.sh accept`): the acceptance config on 96 new games, stopped at 1M moves.
+
+```bash
+uv run python -m block_puzzle_ai.ntuple evaluate --weights models/ntuple_v1.ntw --games 96 --seed 2027 --max-moves 1000000 \
+  --threads 24 --search-k 2 --deep-below 92000 --deep-k 4,2 --games-file runs/yard/accept.jsonl --json > runs/yard/accept.json
+uv run python -m block_puzzle_ai.yardstick runs/yard/accept.json runs/nts_accept/seed777_10M.json --cap 10000000
+```
+
+| Run | Game overs | Moves | Moves / game over | Mean at the 10M cap, projected (full / clamped) |
+|---|---:|---:|---:|---|
+| 96 games, 1M cap, seed `2027` | 11 | 90.3M | 8.21M [4.59M, 16.44M] | 569.0M [400.5M, 737.5M] / 569.0M |
+| Acceptance: 64 games, 10M cap, seed `777` | 63 | 237.8M | 3.77M [2.95M, 4.91M] | 345.3M [280.6M, 420.4M] / 345.3M (observed 365.8M / 365.8M) |
+
+- **The validation failed.** The acceptance's death rate is 2.17× [1.15, 4.13] the 1M-cap run's (p ≈ 0.02).
+- **Two explanations:**
+  - Chance.
+  - A risk that grows with game age. Within the acceptance, games up to 1M moves old had 4.80M [2.75M, 9.29M] moves per game over, and older games 3.53M [2.69M, 4.75M]; the late / early risk ratio is 1.33 [0.81, 2.20].
+- **Spawns cannot explain a rising risk:** past a score of 12M (about 120k moves), every draw of r ≥ 1 allows all 12 groups.
+- **Chance is the likelier explanation.** The split yardstick below, run on games 150k–550k moves old, gives the acceptance's value.
+- **Not used to choose arms.** Even without a bias, 11 game overs give ×/÷ 1.8, too coarse to rank k = 3 or 4 against k = 2. The tool remains for reporting: both means and the risk by game age.
+
+### Split at danger (`scripts/split_yardstick.py`, `scripts/split_estimate.py`)
+
+**Every game over ends a visit to danger.** In all 74 game overs of the two runs, the best Q1 was below 85.2k on the last move, so the deep tier (Q1 < 92k) fired on every one. Hence
+
+```
+death rate = e1 · q1 · p2
+  e1  entries into Q1 < 92k per move                                     free play
+  q1  P(Q1 falls below 85k before it is back at ≥ 92k | entry)           restarts from the entry states
+  p2  P(game over before Q1 is back at ≥ 92k | first move below 85k)     restarts from the states where Q1 fell below 85k
+```
+
+- **Restarts** start at saved states with new spawns. The state (board, tray, score and history) is all that the future depends on.
+- **Comparisons are paired.** Spawns depend only on the RNG and the groups already spawned, not on the moves, and the spawn level is fixed past a score of 12M. So restarts with the same seed face the same pieces under every arm.
+
+**Runs** (acceptance config, 24 worker processes, 2026-11-06, `runs/yard/split1`):
+
+| Step | What | Result | Time |
+|---|---|---|---:|
+| Free play, seed 31 | 24 games: 150k moves to warm up, then 400k counted moves | 8,879 entries in 9.6M moves: e1 = 9.25e-4 [8.98e-4, 9.52e-4] per move. Deep search on 0.19% of moves, as in the acceptance | 16 min |
+| One stage, seed 31 | 40 restarts per entry, until Q1 ≥ 92k or a game over | 92 game overs in 355,160 restarts: 2.59e-4 [1.92e-4, 3.35e-4] per entry; 2.0 moves per restart | 32 min |
+| Capture, seed 32 | 20 restarts per entry, stopped at the first move below 85k | 987 captured states: q1 = 0.556% [0.462%, 0.657%]. No game over without falling below 85k | 16.5 min |
+| Stage 2, seed 41 | 10 restarts per captured state | 361 game overs: p2 = 3.66% [2.93%, 4.44%]; 4.2 moves per restart | 1.6 min |
+
+**Validation:**
+
+| Estimate | Moves / game over | Mean, 10M cap (full / clamped) | Mean, no cap (full / clamped) |
+|---|---:|---|---|
+| Free play, acceptance (63 game overs) | 3.77M [2.95M, 4.91M] | 365.8M / 365.8M (observed) | |
+| Free play, both runs (74 game overs) | 4.43M [3.53M, 5.65M] | | |
+| Split, one stage | 4.17M [3.22M, 5.69M] | 373.4M [302.4M, 463.4M] / 373.4M | 410.8M [316.6M, 559.9M] / 408.6M [316.2M, 547.8M] |
+| Split, two stages | 5.32M [4.23M, 6.91M] | 443.6M [377.2M, 520.0M] / 443.6M | 523.5M [416.3M, 679.9M] / 514.8M [414.0M, 651.0M] |
+
+- **Both split estimates agree with free play.**
+- **The two-stage estimate is about 6× cheaper.** Its interval matches about 64 free-play game overs, the acceptance's precision, and it took 34 minutes against 3.5 hours.
+- **All the risk is below 85k.**
+  - 353,222 of the one-stage restarts never fell below 85k, and none of them ended the game.
+  - All 92 game overs came from the 1,938 restarts (0.55%) that did.
+  - The capture run agrees: 0 game overs in 177,580 restarts without first falling below 85k.
+
+### Search below 85k
+
+Stage 2 for four arms, which differ only below 85k. All four use the same 987 captured states and seeds (`runs/yard/stage2.sh`, `runs/yard/split1/roll_41_s2_*.json`):
+
+| Arm | Widths below 85k | One search (1 thread) | p2 | Death rate vs `accept` (paired) | Moves / game over | Mean, 10M cap (full / clamped) | Extra cost per move |
+|---|---|---:|---:|---:|---:|---|---:|
+| `accept` | [4, 2] | 12 ms | 3.66% | 1 | 5.32M | 443.6M / 443.6M | |
+| `w8` | [8, 4] | 31 ms | 3.56% | 0.972 [0.934, 1.010] | 5.47M | 451.9M / 451.9M | +1 µs |
+| `d4` | [4, 2, 2] | 0.65 s | 3.56% | 0.972 [0.946, 0.996] | 5.47M | 451.9M / 451.9M | +19 µs |
+| `w8d4` | [8, 4, 2] | 1.84 s | 3.45% | 0.945 [0.905, 0.983] | 5.63M | 460.4M / 460.4M | +47 µs |
+
+- **Below 85k, search barely matters.** About 3.5% of the visits that fall below 85k end the game whatever the search does: 150× more search there removes only 5.5% of the game overs. Those game overs are mostly forced by the pieces that come.
+- **The lever is falling below 85k less often.** That happens at e1 · q1 = 5.1e-6 per move, once per 195k moves.
+  - A clamped 1B mean needs 12.2M moves per game over: 2.3× fewer such falls at the same p2 if the two-stage 5.32M is right, and 3.2× fewer if the acceptance's 3.77M is.
+  - What can lower the rate: the search on every move, which changes e1; the search between 85k and 92k, which changes q1 (all four arms use [4, 2] there); and the value function.
+- **The paired design resolves effects of about 5%.** With free play, that would take thousands of game overs.
+
+### Search on every move
+
+The split yardstick for k = 3 and k = 4 on every move, each with [4, 2] below 92k (2026-11-06, 19:58–21:09; `runs/yard/karms.sh`, `runs/yard/split_k3`, `runs/yard/split_k4`).
+- Free play uses the same worker seeds as k = 2, so all three arms see the same pieces. The games still diverge, so these comparisons are unpaired (independent bootstraps, `runs/yard/compare_dirs.py`).
+- The cost is per move at tier 0, with 24 worker processes.
+
+| k | Points / move | e1 per move | q1 | p2 | Moves / game over | Death rate vs k = 2 | Mean, 10M cap (full / clamped) | Mean, no cap (full / clamped) | Cost / move |
+|---:|---:|---:|---:|---:|---:|---:|---|---|---:|
+| 2 | 98.43 | 9.25e-4 | 0.556% | 3.66% | 5.32M [4.23M, 6.91M] | 1 | 443.6M / 443.6M | 523.5M / 514.8M | 1.5 ms |
+| 3 | 100.32 | 4.70e-4 | 0.762% | 4.19% | 6.67M [4.29M, 11.32M] | 0.80 [0.47, 1.32] | 519.6M / 519.6M | 668.8M / 641.8M | 2.0 ms |
+| **4** | **101.34** | 3.29e-4 | 0.673% | 3.97% | **11.36M [8.08M, 17.23M]** | **0.47 [0.30, 0.71]** | 673.9M / 673.9M | **1,151.3M [818.4M, 1,746.5M] / 973.0M [759.1M, 1,235.8M]** | 2.9 ms |
+
+- **k = 4 halves the death rate.** It enters danger 64% less often. The visits it does make are a little more severe: q1 is 21% higher and p2 8% higher.
+- **k = 3 also enters danger half as often**, but its visits are more severe, and its net effect is not significant.
+- **k = 4 projects to 1.15B with full scores, and 973M [759M, 1,236M] clamped.** A clamped 1B at 101.3 points per move needs 11.8M moves per game over, inside k = 4's interval but above its point estimate.
+- **Check against free play.** The free-play phases had 2, 1 and 3 game overs, where the split predicts 1.8, 1.4 and 0.84. For k = 4's 3, P(≥ 3) = 0.054.
+
+**Cost of a 1B acceptance with k = 4** (64 games, at the seed-`2024` cost of 1,949 µs per move per thread on 24 threads):
+
+| Cap | Moves / game | Moves, 64 games | Mean (full / clamped) | 24 threads | Longest game, 1 thread |
+|---:|---:|---:|---|---:|---:|
+| 22M | 9.72M | 622M | 985M / 973M | 14.0 h | 11.9 h |
+| 25M | 10.10M | 647M | 1,024M / 973M | 14.6 h | 13.5 h |
+| 50M | 11.22M | 718M | 1,137M / 973M | 16.2 h | 27.1 h |
+
+- **A cap of about 22M moves costs the clamped mean nothing.** Every point past 21.2M moves is clamped anyway.
+- **Fitting this in 8 hours needs two things:**
+  - a k = 4 search about 1.8× faster;
+  - splitting one game's search across idle threads, about 5 threads for the last game.
+
+### Next methods, in order
+
+1. **Search between 85k and 92k on top of k = 4.** It changes q1, and paired restarts from k = 4's entry states measure that cheaply. Below 85k, search is saturated.
+2. **Speed:** profile the k = 4 search, and split one game's search across idle threads for the tail. Both are needed for a 1B acceptance in one night.
+3. **The 1B acceptance**: k = 4, cap about 22M moves, both means.
+4. **The value function**, if k = 4 is not enough. Danger shows only 1–2 moves ahead, and below 85k about 3.5% of visits are lost whatever the search does.
