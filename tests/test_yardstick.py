@@ -70,8 +70,14 @@ def test_expected_capped_and_int32_clamp():
     assert expected_capped(1e6, 1e12) == pytest.approx(1e6)
     assert expected_capped(1e12, 1e6) == pytest.approx(1e6, rel=1e-5)
     assert expected_capped(math.inf, 5.0) == 5.0
-    p = project([{"score": 100 * 10**7, "moves": 10**7, "truncated": False}])  # m = 1e7 moves, mean 1e9 uncapped
+    p = project([{"score": 100 * 10**7, "moves": 10**7, "truncated": False}], cap=1e7)  # m = 1e7 moves, mean 1e9
     assert p["mean_int32"] == pytest.approx(1e9 * (1 - math.exp(-INT32_MAX / 1e9)))  # 0.88B
+    assert p["mean_int32_at_cap"] == pytest.approx(p["mean_at_cap"])  # a 1e7-move cap stops scores at 1e9 < 2^31
+    p = project([{"score": 100 * 10**7, "moves": 10**7, "truncated": False}], cap=1e8)
+    assert p["mean_int32_at_cap"] == pytest.approx(p["mean_int32"]) and p["mean_int32"] < p["mean_at_cap"]
+    two = [{"score": 3 * 10**9, "moves": 3 * 10**7, "truncated": False}, {"score": 10**9, "moves": 10**7, "truncated": True}]
+    p = project(two)
+    assert p["observed_mean"] == 2e9 and p["observed_mean_int32"] == (INT32_MAX + 1e9) / 2 and p["games_past_int32"] == 1
 
 
 def test_hazard_by_age_and_drift():

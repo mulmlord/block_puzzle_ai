@@ -10,8 +10,10 @@ constant and game lengths are exponential with mean m = moves per game over. The
 Many short capped games estimate m as well as a few long games with the same number of game overs, and no single
 game sets the wall time. Precision is set by the game overs D alone: the 95% interval on m is roughly ×/÷ e^(2/√D).
 
-The game stores the score as a 32-bit int (docs/RULES.md), so the real game cannot show more than INT32_MAX.
-``mean_int32`` is the projected mean with every game's score clamped there.
+The game stores the score as a 32-bit int (docs/RULES.md), so the real game cannot show more than INT32_MAX. Every
+mean is reported twice: with the simulator's full scores, and with each game's score clamped at INT32_MAX
+(``*_int32``). Clamping a score at INT32_MAX is a move cap of INT32_MAX / points per move, so it combines with any
+other cap. (The real game's spawn level would also change past the limit; the simulator keeps 64-bit scores.)
 
     uv run python -m block_puzzle_ai.yardstick runs/a.json [runs/b.json ...] [--cap 10000000]
 
@@ -89,8 +91,10 @@ def project(results: list[dict], cap: float | None = None, level: float = 0.95) 
     def mean(mm: float, c: float | None) -> float:
         return ppm * (mm if c is None else expected_capped(mm, c))
 
-    def mean_int32(mm: float) -> float:  # score ~ ppm * moves, clamped at INT32_MAX
-        return INT32_MAX if math.isinf(mm) else ppm * mm * -math.expm1(-INT32_MAX / (ppm * mm)) if ppm else 0.0
+    clamp = INT32_MAX / ppm if ppm else math.inf  # the move count at which the score reaches INT32_MAX
+
+    def mean_int32(mm: float, c: float | None) -> float:
+        return ppm * expected_capped(mm, min(clamp, math.inf if c is None else c)) if ppm else 0.0
 
     out = {
         "games": len(results),
@@ -101,13 +105,21 @@ def project(results: list[dict], cap: float | None = None, level: float = 0.95) 
         "moves_per_death_ci": [m_lo, m_hi],
         "mean_uncapped": mean(m, None),
         "mean_uncapped_ci": [mean(m_lo, None), mean(m_hi, None)],
-        "mean_int32": mean_int32(m),
-        "mean_int32_ci": [mean_int32(m_lo), mean_int32(m_hi)],
+        "mean_int32": mean_int32(m, None),
+        "mean_int32_ci": [mean_int32(m_lo, None), mean_int32(m_hi, None)],
         "observed_mean": points / max(1, len(results)),
+        "observed_mean_int32": sum(min(r["score"], INT32_MAX) for r in results) / max(1, len(results)),
+        "games_past_int32": sum(r["score"] > INT32_MAX for r in results),
         "observed_cap": max((r["moves"] for r in results if r["truncated"]), default=None),
     }
     if cap is not None:
-        out |= {"cap": cap, "mean_at_cap": mean(m, cap), "mean_at_cap_ci": [mean(m_lo, cap), mean(m_hi, cap)]}
+        out |= {
+            "cap": cap,
+            "mean_at_cap": mean(m, cap),
+            "mean_at_cap_ci": [mean(m_lo, cap), mean(m_hi, cap)],
+            "mean_int32_at_cap": mean_int32(m, cap),
+            "mean_int32_at_cap_ci": [mean_int32(m_lo, cap), mean_int32(m_hi, cap)],
+        }
     return out
 
 
@@ -163,8 +175,11 @@ def report(path: str | Path, cap: float | None) -> dict:
     print(f"  projected mean, scores clamped at 2^31: {_m(p['mean_int32'])} [{_m(lo)}, {_m(hi)}]")
     if cap is not None:
         lo, hi = p["mean_at_cap_ci"]
-        print(f"  projected mean at a {cap:,.0f}-move cap: {_m(p['mean_at_cap'])} [{_m(lo)}, {_m(hi)}]")
-    print(f"  observed mean {_m(p['observed_mean'])} (games stopped at {p['observed_cap'] or 'no cap'})")
+        lo2, hi2 = p["mean_int32_at_cap_ci"]
+        print(f"  projected mean at a {cap:,.0f}-move cap: {_m(p['mean_at_cap'])} [{_m(lo)}, {_m(hi)}], "
+              f"clamped at 2^31: {_m(p['mean_int32_at_cap'])} [{_m(lo2)}, {_m(hi2)}]")
+    print(f"  observed mean {_m(p['observed_mean'])}, clamped at 2^31: {_m(p['observed_mean_int32'])} "
+          f"({p['games_past_int32']} games past 2^31; games stopped at {p['observed_cap'] or 'no cap'})")
     for a, b, exposure, deaths in hazard_by_age(results):
         rate = f"{_m(exposure / deaths)} moves per game over" if deaths else "no game over"
         print(f"    age {a / 1e6:5.1f}-{b / 1e6:5.1f}M: {exposure / 1e6:8.1f}M moves, {deaths:3d} game overs, {rate}")
