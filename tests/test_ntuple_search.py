@@ -273,6 +273,21 @@ def test_search_threads_independent():
     assert sum(r[6][0] for r in one) > 0
 
 
+def test_idle_threads_join_a_game():
+    """With fewer games than threads, idle threads take part of each search (Helpers): same games as one thread,
+    on both a depth-2 and a depth-3 tier, and faster."""
+    _, model = random_model()
+    tiers = [(INF, [3]), (60.0, [3, 2])]
+    t0 = time.perf_counter()
+    one = run_search(model, 3, 9, 300, 1, tiers)
+    t1 = time.perf_counter()
+    many = run_search(model, 3, 9, 300, 8, tiers)
+    t2 = time.perf_counter()
+    assert [[*r[:7], r[8]] for r in one] == [[*r[:7], r[8]] for r in many]
+    assert all(r[5][0] > 0 and r[5][1] > 0 for r in one)  # both tiers are used in every game
+    assert t2 - t1 < 0.8 * (t1 - t0)
+
+
 def test_skip_and_callback():
     _, model = random_model()
     tiers = [(INF, [2]), (50.0, [4])]
