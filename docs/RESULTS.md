@@ -516,3 +516,42 @@ Arms (64 games, seed `2024`, 200,000-move cap, 24 threads). Death rates are rela
 - **Every-move search raises points per move:** 94 → 98.4, 101.3 and 103.1 for k = 2, 4 and 8. Gated search does not (94.0–94.2). That answers the spec's question, but the gain is 5–10%. The mean moves through survival.
 - **The 200k cap now binds:** 58–63 of 64 games are alive at it. Means near 20M are about 200k × points per move, so they no longer rank the every-move arms. k = 8 against k = 2 is +1.93M [+0.85M, +3.11M].
 - **The plan's projection is obsolete.** It assumed about 1.06M moves per game at the 10M cap. k = 2 already gives about 2M moves per game over, so the acceptance is now bound by compute (long games), not by survival.
+
+### Depth 3
+
+**Where to place the depth-3 tier.** Game overs give only 2–4 moves of warning. Best Q1 before the game overs (`runs/nts_d3/danger.py`), against about 92.5k on ordinary moves:
+
+| Arm | Game overs | 10 moves before | 3 moves before | Last move |
+|---|---:|---:|---:|---:|
+| k = 2 | 6 | 92.2k (p10 89.4k) | 87.4k (p10 63.4k) | 74.1k (p10 52.9k) |
+| gate G = 92k | 18 | 92.5k (p10 91.8k) | 91.5k (p10 75.9k) | 70.7k (p10 52.6k) |
+
+With k = 2 on every move, the best Q1 falls below G₂ = 90k on 0.005% of moves, below 91.5k on 0.044–0.047% and below 92k on 0.17–0.19%. One depth-3 search costs 42 ms on one thread with widths [4, 2], and 159 ms with [8, 4].
+
+Arms: k = 2 on every move plus the tier (G₂, widths); 64 games, seed `2024`, 200,000-move cap, 24 threads. Death rates are relative to k = 2:
+
+| Arm | Deep tier rate | µs / move | Mean | Game overs | Moves / game over | Points / move | Death rate | vs k = 2 (mean) | Time |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| k = 2 | 0 | 1,002 | 18,432,223 | 6 | 1,997,181 | 98.4 | 1 | | 9.4 min |
+| G₂ 91.5k, [4, 2] | 0.047% | 1,133 | 18,478,363 | 7 | 1,715,593 | 98.5 | 1.16 [0.39, 3.46] | +0.05M [−1.39M, +1.48M] | 11 min |
+| **G₂ 92k, [4, 2]** | 0.19% | 1,164 | **19,492,663** | 2 | 6,335,280 | 98.5 | 0.32 [0.06, 1.56] | **+1.06M [+0.07M, +2.21M]** | 11 min |
+| G₂ 91.5k, [8, 4] | 0.044% | 1,060 | 19,287,005 | 2 | 6,267,769 | 98.5 | 0.32 [0.06, 1.58] | +0.85M [−0.30M, +2.09M] | 11 min |
+| G₂ 92k, [8, 4] | 0.17% | 1,347 | 19,429,431 | 2 | 6,314,220 | 98.5 | 0.32 [0.06, 1.57] | +1.00M [−0.08M, +2.19M] | 13 min |
+
+- The tier helps when it covers enough positions (92k) or searches wide enough ([8, 4]). [4, 2] at 91.5k did not help.
+- The three 2-game-over arms cannot be told apart. Together they have 6 game overs in 38M moves, against k = 2's 6 in 12M: a death rate of 0.32 [0.10, 0.98].
+- Points per move do not change. The tier fires too rarely to matter for them.
+
+**Chosen configuration:** `--search-k 2 --deep-below 92000 --deep-k 4,2`, the highest mean.
+
+**Projection to the acceptance (seed `777`, 10M cap).** Survival is modelled as a constant death rate per move, so expected moves per game = m · (1 − e^(−cap / m)), where m is moves per game over:
+
+| m | Moves / game | Mean (at 98.5 points / move) | Work on 24 threads |
+|---|---:|---:|---:|
+| 6.33M (point estimate) | 5.03M | 495M | 4.3 h |
+| 1.75M (95% low) | 1.75M | 172M | 1.5 h |
+| 52M (95% high) | 9.10M | 897M | 7.8 h |
+
+- A 10M-move game takes about 3.2 h at the 24-thread cost.
+- All 64 games at the cap would take 8.6 h, which is over the 8-hour budget only in the case where almost no game dies.
+- Every move with k = 4 or k = 8 does not fit. k = 4 is 1,949 µs per move with about 12.6M moves per game over (1 game over), which projects to about 10 h.
