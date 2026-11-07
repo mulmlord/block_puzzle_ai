@@ -365,6 +365,18 @@ def test_train_tc_and_init_cli(tmp_path):
         main(train_args(tmp_path / "d", 20_000) + ["--init", init, "--shapes", "window4"])
 
 
+def test_train_search_targets_cli(tmp_path):
+    main(train_args(tmp_path / "a", 3000) + ["--target-k", "2", "--play-search"])
+    cfg, _, _, meta = load_checkpoint(tmp_path / "a" / "latest.ntw")
+    assert cfg.target_k == 2 and cfg.play_search and meta["moves_trained"] >= 3000
+    main(train_args(tmp_path / "a", 6000) + ["--resume"])  # keeps both
+    cfg = load_checkpoint(tmp_path / "a" / "latest.ntw")[0]
+    assert cfg.target_k == 2 and cfg.play_search
+    for bad in (["--play-search"], ["--target-k", "-1"]):
+        with pytest.raises(SystemExit):
+            main(train_args(tmp_path / "b", 3000) + bad)
+
+
 def test_resume_keeps_best(tmp_path):
     main(train_args(tmp_path, 100_000))
     lines = (tmp_path / "metrics.jsonl").read_text().splitlines()
@@ -379,7 +391,9 @@ def test_resume_keeps_best(tmp_path):
 def test_interrupt_saves_latest(tmp_path):
     proc = subprocess.Popen([sys.executable, "-m", "block_puzzle_ai.ntuple", "train", "--out", str(tmp_path), "--hours",
                              "1", "--threads", "1", "--shapes", "line", "--eval-minutes", "60", "--chunk-seconds", "1"])  # fmt: skip
-    time.sleep(8)
+    metrics, deadline = tmp_path / "metrics.jsonl", time.monotonic() + 120  # startup imports torch: slow on a busy machine
+    while not (metrics.exists() and '"train"' in metrics.read_text()) and time.monotonic() < deadline:
+        time.sleep(0.5)
     proc.send_signal(signal.SIGINT)
     assert proc.wait(timeout=30) == 0
     assert load_checkpoint(tmp_path / "latest.ntw")[3]["moves_trained"] > 0

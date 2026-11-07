@@ -132,6 +132,8 @@ class NTupleConfig:
     threads: int = 24
     seed: int = 0
     tc: bool = False  # temporal-coherence step sizes per weight; alpha is then the meta step size
+    target_k: int = 0  # search-backed targets with depth 2 on the top K moves (0: the next state's best Q1)
+    play_search: bool = False  # with target_k, play the searched move instead of the 1-ply move
     init: str | None = None  # the checkpoint a run started from, if not from zero weights
 
 
@@ -254,10 +256,12 @@ def _best_so_far(metrics: Path) -> float:
 def train(args: argparse.Namespace) -> None:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    names = ("alpha", "alpha_k", "restart_frac", "threads", "seed")
+    names = ("alpha", "alpha_k", "restart_frac", "threads", "seed", "target_k")
     overrides = {k: getattr(args, k) for k in names if getattr(args, k) is not None}
     if args.tc:
         overrides["tc"] = True
+    if args.play_search:
+        overrides["play_search"] = True
     if args.resume:
         model, cfg, meta = load_model(out / "latest.ntw")
         if args.shapes is not None and args.shapes.split(",") != cfg.shapes:
@@ -296,7 +300,10 @@ def train(args: argparse.Namespace) -> None:
         tc = tc_state()
         return model.weights.copy(), None if tc is None else tc.copy()
     # mixing in the moves so far gives a resumed run fresh random streams
-    trainer = _engine.Trainer(model, cfg.gamma, 0.0, cfg.restart_frac, cfg.threads, cfg.seed + moves)
+    if cfg.target_k < 0 or (cfg.play_search and cfg.target_k == 0):
+        raise SystemExit("--target-k must be >= 1 for search-backed targets, and --play-search needs it")
+    widths = [cfg.target_k] if cfg.target_k else []
+    trainer = _engine.Trainer(model, cfg.gamma, 0.0, cfg.restart_frac, cfg.threads, cfg.seed + moves, widths, cfg.play_search)
     probe = trainer.run(1000 * cfg.threads)  # alpha 0: measures V before the first learning chunk; not counted
     trainer.alpha = scheduled_alpha(cfg.alpha, cfg.alpha_k, probe["value_mean"])
     guard = CollapseGuard()
@@ -405,6 +412,9 @@ def main(argv: list[str] | None = None) -> None:
     start.add_argument("--resume", action="store_true", help="continue from OUT/latest.ntw")
     start.add_argument("--init", help="start a new run from this checkpoint's weights, shapes and gamma")
     t.add_argument("--tc", action="store_true", help="temporal-coherence step sizes per weight (ALPHA is the meta step size)")
+    t.add_argument("--target-k", type=int, help="search-backed targets: depth 2 on the top K moves at every state "
+                   "(docs/superpowers/specs/2026-11-07-search-targets-design.md)")
+    t.add_argument("--play-search", action="store_true", help="with --target-k, play the searched move (default: the 1-ply move)")
     t.add_argument("--shapes", help="comma-separated tuple shapes (default window4,line)")
     t.add_argument("--gamma", type=float)
     t.add_argument("--alpha", type=float, help="step-size cap (default min(0.1, 0.5 / threads))")
