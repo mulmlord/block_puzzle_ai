@@ -3,7 +3,7 @@
 A reinforcement-learning agent for the Android game **Block Puzzle** (`game.puzzle.blockpuzzle` v6.1).
 The game rules were reverse-engineered from the shipped APK, re-implemented as a fast simulator,
 and used to train agents that score far more than a hand-tuned heuristic:
-- An **n-tuple network with expectimax search** averages **365.8 million** points per game (64 games, 10M-move cap). Its best game scored **984 million**, and the cap stopped it while it was still alive. It was trained and plays on the CPU, with the C++ engine.
+- An **n-tuple network with expectimax search** averages **1.16 billion** points per game (64 games, 22M-move cap), and 1.15 billion with each game clamped at the game's 32-bit score limit. Its best game scored **2.23 billion**, and the cap stopped it while it was still alive. It was trained and plays on the CPU, with the C++ engine.
 - The neural agent `rl_v2` averages **6.8 million** points per game on its own, about 300× the heuristic. Its best game of 256 scored **38.8 million**. With a danger-gated lookahead search on top, it averages **12.3 million**.
 A browser app lets you watch `rl_v2` play live.
 
@@ -29,10 +29,13 @@ The 20,000-move cap *understates* the RL agents: 54 of the 128 `rl_v1` games wer
 | **`rl_v2` + lookahead search** | **11,158,066**\* | **7,589,755** | **117,387** | | |
 | n-tuple `runs/nt1/best.ntw` (8 h, CPU) | 6,192,662 | 4,224,940 | 72,672 | | |
 | **n-tuple + search** (`models/ntuple_v1.ntw`, 10M-move cap)† | **365,777,118** | **320,815,295** | **3,774,622** | | |
+| **n-tuple + wider search** (`models/ntuple_v1.ntw`, 22M-move cap)‡ | **1,164,852,934** | **1,070,481,810** | **14,148,484** | | |
 
 \*12 of the 64 games were still alive at the cap, so this is a lower bound.
 
 †Played with a 10M-move cap instead of 200,000; 1 of the 64 games was still alive at it.
+
+‡Played with a 22M-move cap; 12 of the 64 games were still alive at it, all past 2³¹ − 1. The game stores the score as a 32-bit int: with each game clamped at 2,147,483,647, the mean is 1,149,503,618.
 
 - **`rl_v2`** comes from a 10-hour fine-tune of `rl_v1` (ticket #8). Its mean is 2.5× `rl_v1`'s: +3.91M, bootstrap 95% CI [+2.39M, +5.54M].
   - **High score: 38,818,140 points** in a single 331,683-move game, without search.
@@ -40,6 +43,7 @@ The 20,000-move cap *understates* the RL agents: 54 of the 128 `rl_v1` games wer
 - **Lookahead search** (`--search`) adds +4.65M [+2.13M, +7.12M] to `rl_v2`'s mean, 1.7×, and halves its death rate.
 - **n-tuple learner** (ticket #10, technique 7): 8 hours of TD(0) on the C++ engine tie `rl_v2`'s mean (−0.31M [−2.35M, +1.76M]). It survives longer but scores 94 instead of 117 points per move. One of its games scored **42,324,610**, the highest yet, with a 10M-move cap ([results](docs/RESULTS.md#8-hour-run-runsnt1)).
 - **n-tuple + expectimax search** (ticket #10): the n-tuple agent searches 2 levels deep on every move (`--search-k 2`), and 3 deep when its value drops (`--deep-below 92000 --deep-k 4,2`). That raises the mean to **365.8 million**, 3.7× the 100M goal, with 50× fewer game overs. One game scored **984,183,190** and was still alive at the 10M-move cap ([results](docs/RESULTS.md#n-tuple-search-ticket-10)).
+- **Wider search** (ticket #10): the top 4 moves instead of 2 on every move (`--search-k 4`), and widths 8, 4 when the value drops (`--deep-k 8,4`), cut game overs 3.7×. With idle threads joining the remaining games, the 64 games took 13.5 h. The mean is **1,164.9 million** [985.7M, 1,345.2M], and **1,149.5 million** [975.4M, 1,324.2M] clamped at 2³¹ − 1: both past the 1B goal. The high score is **2,229,751,750** ([results](docs/RESULTS.md#1b-acceptance)).
 - See [`docs/RESULTS.md`](docs/RESULTS.md).
 - **Scoring efficiency:** the agent scores more points per move than the heuristic because it deliberately sets up multi-line clears. The game pays `50·L·(L+1)` for `L` simultaneous lines.
 
