@@ -246,6 +246,42 @@ public:
         }
     }
 
+    // Temporal-coherence step sizes (Beal & Smith 1999; Jaskowski 2018 for 2048 n-tuple networks). Per weight,
+    // E sums the steps it was asked to take and A their sizes, so |E| / A is 1 while the steps agree in sign and
+    // falls towards 0 while they cancel. Stored as (E, A) pairs of doubles: a float A stops growing once it is
+    // 2^24 steps, after a few million moves for the fit weights read on every move.
+    void enable_tc() {
+        if (tc_.empty()) tc_.assign(2 * w_.size(), 0.0);
+    }
+    bool tc_enabled() const { return !tc_.empty(); }
+    double* tc_state() { return tc_.data(); }
+
+    // TD step with temporal-coherence rates: with delta = (target - V(a)) / n_lookups, each looked-up weight
+    // moves by alpha * rate * delta, rate = |E| / A (1 while A is 0), then E += delta and A += |delta|.
+    void update_tc(const Afterstate& a, double target, float alpha) {
+        uint32_t idx[MAX_LOOKUPS];
+        const int n = lookups(a, idx);
+        double v = 0;
+        for (int k = 0; k < n; k++) v += load(idx[k]);
+        const double delta = (target - v) / n;
+        constexpr auto relaxed = std::memory_order_relaxed;
+        for (int k = 0; k < n; k++) {
+            std::atomic_ref<float> w(w_[idx[k]]);
+            std::atomic_ref<double> e(tc_[2 * size_t{idx[k]}]), s(tc_[2 * size_t{idx[k]} + 1]);
+            const double E = e.load(relaxed), A = s.load(relaxed);
+            const double rate = A > 0 ? std::abs(E) / A : 1.0;
+            w.store(w.load(relaxed) + static_cast<float>(alpha * rate * delta), relaxed);
+            e.store(E + delta, relaxed);
+            s.store(A + std::abs(delta), relaxed);
+        }
+    }
+
+    // update_tc once TC is enabled, update otherwise
+    void learn(const Afterstate& a, double target, float alpha) {
+        if (tc_enabled()) update_tc(a, target, alpha);
+        else update(a, target, alpha);
+    }
+
 private:
     struct Mask {
         uint64_t lo, hi;
@@ -260,6 +296,7 @@ private:
     std::vector<Mask> masks_;
     uint32_t fit_offset_ = 0, rem_offset_ = 0;
     std::vector<float> w_;
+    std::vector<double> tc_;  // temporal coherence: (E, A) per weight, empty until enable_tc
     // child_eval's tables
     Board piece_sym_[MAX_PIECES][8] = {};  // each piece at position 0 under the 8 symmetries
     int sym_shift_[CELLS][8] = {};  // moving a piece from 0 to pos translates its image: shift(piece_sym_, this)
@@ -514,10 +551,10 @@ private:
                     w.ring_head = (w.ring_head + 1) % RING;
                     w.ring_size = std::min(w.ring_size + 1, RING);
                 }
-                nt_.update(a, next.q, alpha);
+                nt_.learn(a, next.q, alpha);
                 w.choice = next;
             } else {
-                nt_.update(a, 0.0, alpha);
+                nt_.learn(a, 0.0, alpha);
                 game_over(w, st);
                 new_game(w, st);
             }

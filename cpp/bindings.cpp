@@ -215,7 +215,25 @@ NB_MODULE(_engine, m) {
             [](bpa::NTuple& n, uint64_t lo, uint64_t hi, const std::vector<int>& remaining, bool cooldown, double target,
                float alpha) { n.update(make_afterstate(n.tables(), lo, hi, remaining, cooldown), target, alpha); },
             nb::arg("board_lo"), nb::arg("board_hi"), nb::arg("remaining"), nb::arg("cooldown"), nb::arg("target"),
-            nb::arg("alpha"), "TD step: each looked-up weight += alpha * (target - V) / n_lookups");
+            nb::arg("alpha"), "TD step: each looked-up weight += alpha * (target - V) / n_lookups")
+        .def("enable_tc", &bpa::NTuple::enable_tc, "allocate temporal-coherence state; the trainer then uses update_tc")
+        .def_prop_ro("tc_enabled", &bpa::NTuple::tc_enabled)
+        .def_prop_ro(
+            "tc_state",
+            [](bpa::NTuple& n) {
+                if (!n.tc_enabled()) throw std::runtime_error("temporal coherence is not enabled");
+                return nb::ndarray<nb::numpy, double, nb::ndim<2>>(n.tc_state(), {n.n_weights(), 2}, nb::handle());
+            },
+            nb::rv_policy::reference_internal, "writable float64 view of the (E, A) pair per weight")
+        .def(
+            "update_tc",
+            [](bpa::NTuple& n, uint64_t lo, uint64_t hi, const std::vector<int>& remaining, bool cooldown, double target,
+               float alpha) {
+                if (!n.tc_enabled()) throw std::runtime_error("temporal coherence is not enabled");
+                n.update_tc(make_afterstate(n.tables(), lo, hi, remaining, cooldown), target, alpha);
+            },
+            nb::arg("board_lo"), nb::arg("board_hi"), nb::arg("remaining"), nb::arg("cooldown"), nb::arg("target"),
+            nb::arg("alpha"), "TD step scaled per weight by |E| / A (1 before its first step)");
 
     nb::class_<bpa::Trainer>(m, "Trainer", "lock-free multithreaded TD(0) self-play with restarts near game overs")
         .def(nb::init<bpa::NTuple&, float, float, double, int, uint64_t>(), nb::arg("ntuple"), nb::arg("gamma"),
