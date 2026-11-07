@@ -827,3 +827,32 @@ The 1B goal is met. If the goal moves higher:
 1. **The value function.** Danger shows only 1–2 moves ahead, and below 85k about 3.5% of visits are lost whatever the search does. The 8-hour training run found its best weights after 62 minutes and did not improve over the remaining 6.5 hours, so stable training (temporal-coherence step sizes) comes first, then search-backed targets.
 2. **Points per move.** `rl_v2` gets 117 per move, against 101.3 here.
 3. **The clamp sets a ceiling.** The clamped mean cannot exceed 2,147.5M, and a game past about 21.2M moves counts as 2,147.5M however long it goes on. A clamped 1.5B would need about 28M moves per game over, twice today's.
+
+## Value function (ticket #10)
+
+### Temporal-coherence pilot
+
+**Method.** Temporal coherence (Beal & Smith 1999; Jaśkowski 2018 for 2048 n-tuple networks) gives every weight its own step size:
+- E sums the steps the weight was asked to take, and A their sizes.
+- Each step is scaled by |E| / A: 1 while the steps agree in sign, and towards 0 while they cancel.
+
+`ntuple train --tc` keeps (E, A) as doubles per weight and saves them in checkpoints. `--init` starts a new run from a checkpoint's weights.
+
+**Runs** (2026-11-07, 15:26–16:58, `runs/tc_pilot/run.sh`). Both arms fine-tuned `models/ntuple_v1.ntw` for 1.5 h, side by side on 12 threads each. Both used the 24-thread runs' step-size cap of 0.0208 and the collapse guard. The evaluation is the periodic one (256 games, seed `2024`, 200,000-move cap); on it, `ntuple_v1` gave 70,785 moves per game over and 94.0 points per move.
+
+```bash
+common="--init models/ntuple_v1.ntw --hours 1.5 --threads 12 --alpha 0.0208 --eval-minutes 15"
+uv run python -m block_puzzle_ai.ntuple train --out runs/tc_pilot/plain $common
+uv run python -m block_puzzle_ai.ntuple train --out runs/tc_pilot/tc $common --tc
+```
+
+| Arm | Rollbacks | Cap at the end | Moves | Moves / game over at 17 / 34 / 52 / 68 / 85 / 92 min | Mean of the 6 | Points / move |
+|---|---:|---:|---:|---|---:|---:|
+| Plain TD | 3 (at 38M, 69M and 95M moves) | 0.0026 | 647M | 84.4k / 80.4k / 88.6k / 73.0k / 75.9k / 86.8k | 81.5k | 91.8–94.6 |
+| **TC** | **0** | 0.0208 | 633M | 82.7k / 78.3k / 83.8k / 79.2k / 73.4k / 77.3k | 79.1k | 93.6–94.5 |
+
+- **TC keeps training stable at the full step size.**
+  - Plain TD collapsed three times in its first 16 minutes. Each time the guard restored older weights and halved the cap, from 0.0208 to 0.0026.
+  - TC ran all 90 minutes at 0.0208 without a rollback.
+- **It trains no better.** The two arms are level, and both are about 10% above `ntuple_v1`. One evaluation's interval is ×/÷ 1.14, and neither arm's points per move moved.
+- **Fine-tuning has reached what these tuples can represent,** so step sizes are not the limit. The next lever is the target: train the value towards what the search finds.
