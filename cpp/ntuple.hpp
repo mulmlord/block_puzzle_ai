@@ -42,8 +42,20 @@ struct BoardEval {
     int group_count[MAX_GROUPS] = {};  // summed over each group's pieces
 };
 
+// What the children of one board reuse (NTuple::child_eval): its tuple lookups and its pieces' legal positions.
+struct BoardParts {
+    std::vector<uint32_t> idx;  // weight index of each tuple lookup, in board_eval's order
+    std::vector<float> w;  // the weight read at each of them
+    Board legal[MAX_PIECES] = {};  // legal_positions of each piece
+};
+
 // 0, 1, 2, 3-4, 5-8, 9-16, 17-32, 33+ -> 0..7
 inline int fit_bucket(int n) { return n < 3 ? n : std::min(7, std::bit_width(static_cast<unsigned>(n - 1)) + 1); }
+
+inline int popcount128(Board b) { return std::popcount(static_cast<uint64_t>(b)) + std::popcount(static_cast<uint64_t>(b >> 64)); }
+
+// b shifted towards higher bits by d (d < 0: towards lower bits), |d| < 128
+inline Board shift(Board b, int d) { return d >= 0 ? b << d : b >> -d; }
 
 // The 8 symmetries of the 10x10 board, from row-wise tables for a horizontal flip and a transpose.
 class Symmetries {
@@ -126,6 +138,7 @@ public:
         fit_offset_ = static_cast<uint32_t>(offset);
         rem_offset_ = fit_offset_ + 2 * t_.n_groups * FIT_BUCKETS;
         w_.assign(rem_offset_ + t_.n_groups * FIT_BUCKETS, 0.0f);
+        init_children();
     }
 
     size_t n_weights() const { return w_.size(); }
@@ -143,6 +156,59 @@ public:
             for (const Board b : boards) sum += load(tuple_index(m, b));
         e.tuples = sum;
         placement_counts(board, e.count, e.group_count);
+        return e;
+    }
+
+    BoardParts parts(Board board) const {
+        BoardParts p;
+        Board boards[8];
+        symmetries().all(board, boards);
+        p.idx.reserve(8 * masks_.size());
+        p.w.reserve(8 * masks_.size());
+        for (const Mask& m : masks_) {
+            for (const Board b : boards) {
+                p.idx.push_back(tuple_index(m, b));
+                p.w.push_back(load(p.idx.back()));
+            }
+        }
+        for (int q = 0; q < t_.n_pieces; q++) p.legal[q] = legal_positions(t_, board, q);
+        return p;
+    }
+
+    // board_eval(placed.board), bit for bit, where placed = apply(t, board, piece, pos) and parent = parts(board).
+    // Without a line clear the child is the parent plus the piece's cells, so only the lookups that read those
+    // cells change, and a piece's legal positions lose those the new cells block; the sum keeps board_eval's order.
+    BoardEval child_eval(const BoardParts& parent, int piece, int pos, const Placed& placed) const {
+        if (placed.lines) return board_eval(placed.board);
+        const int n = static_cast<int>(parent.w.size());
+        float w[8 * MAX_TUPLES];
+        std::copy_n(parent.w.data(), n, w);
+        Board img[8];  // the piece at pos under each symmetry
+        for (int s = 0; s < 8; s++) img[s] = shift(piece_sym_[piece][s], sym_shift_[pos][s]);
+        uint64_t touched[TOUCH_WORDS] = {};
+        for (int k = 0; k < t_.size[piece]; k++) {
+            const uint64_t* tc = &touch_[(pos + t_.offsets[piece][k]) * touch_words_];
+            for (int j = 0; j < touch_words_; j++) touched[j] |= tc[j];
+        }
+        for (int j = 0; j < touch_words_; j++) {
+            for (uint64_t bits = touched[j]; bits; bits &= bits - 1) {
+                const int k = 64 * j + std::countr_zero(bits);
+                const Mask& m = masks_[k >> 3];
+                const Board b = img[k & 7];  // its cells were empty in the parent: their bits add to the index
+                const uint64_t lo = extract_bits(static_cast<uint64_t>(b), m.lo);
+                const uint64_t hi = extract_bits(static_cast<uint64_t>(b >> 64), m.hi);
+                w[k] = load(parent.idx[k] + static_cast<uint32_t>(lo | hi << m.lo_bits));
+            }
+        }
+        BoardEval e;
+        double sum = 0;
+        for (int k = 0; k < n; k++) sum += w[k];
+        e.tuples = sum;
+        const int d = pos - block_center_;
+        for (int p = 0; p < t_.n_pieces; p++) {
+            e.count[p] = popcount128(parent.legal[p] & ~shift(blocks_[piece][p], d));
+            e.group_count[t_.group[p]] += e.count[p];
+        }
         return e;
     }
 
@@ -187,12 +253,50 @@ private:
         uint32_t offset;
     };
     static constexpr int MAX_LOOKUPS = 8 * MAX_TUPLES + MAX_GROUPS + 2;
+    static constexpr int TOUCH_WORDS = (8 * MAX_TUPLES + 63) / 64;
 
     Tables t_;
     std::vector<std::vector<int>> tuples_;
     std::vector<Mask> masks_;
     uint32_t fit_offset_ = 0, rem_offset_ = 0;
     std::vector<float> w_;
+    // child_eval's tables
+    Board piece_sym_[MAX_PIECES][8] = {};  // each piece at position 0 under the 8 symmetries
+    int sym_shift_[CELLS][8] = {};  // moving a piece from 0 to pos translates its image: shift(piece_sym_, this)
+    int touch_words_ = 0;
+    std::vector<uint64_t> touch_;  // bit k of row c: lookup k (board_eval's order) reads cell c
+    int block_center_ = 0;  // the largest cell offset of any piece
+    Board blocks_[MAX_PIECES][MAX_PIECES] = {};  // x at pos blocks p at shift(blocks_[x][p], pos - block_center_)
+
+    void init_children() {
+        for (int pos = 0; pos < CELLS; pos++) {
+            const int r = pos / N, c = pos % N;  // symmetries().all's order: id, h, v, vh, t, ht, vt, vht
+            const int d[8] = {N * r + c, N * r - c, -N * r + c, -N * r - c, N * c + r, N * c - r, -N * c + r, -N * c - r};
+            std::copy(d, d + 8, sym_shift_[pos]);
+        }
+        for (int p = 0; p < t_.n_pieces; p++) symmetries().all(t_.shape[p], piece_sym_[p]);
+        touch_words_ = (8 * static_cast<int>(masks_.size()) + 63) / 64;
+        touch_.assign(CELLS * touch_words_, 0);
+        for (int c = 0; c < CELLS; c++) {
+            Board img[8];
+            symmetries().all(bit(c), img);
+            for (size_t i = 0; i < masks_.size(); i++) {
+                for (int s = 0; s < 8; s++) {
+                    if (!((static_cast<uint64_t>(img[s]) & masks_[i].lo) | (static_cast<uint64_t>(img[s] >> 64) & masks_[i].hi)))
+                        continue;
+                    const size_t k = 8 * i + s;
+                    touch_[c * touch_words_ + k / 64] |= uint64_t{1} << (k % 64);
+                }
+            }
+        }
+        // legal_positions: p is blocked at q when q + off is filled for an offset off of p, so x at pos blocks
+        // p at pos + o - off for each offset o of x: the union over off of shape[x] << (pos - off)
+        for (int p = 0; p < t_.n_pieces; p++)
+            for (int k = 0; k < t_.size[p]; k++) block_center_ = std::max(block_center_, t_.offsets[p][k]);
+        for (int x = 0; x < t_.n_pieces; x++)
+            for (int p = 0; p < t_.n_pieces; p++)
+                for (int k = 0; k < t_.size[p]; k++) blocks_[x][p] |= t_.shape[x] << (block_center_ - t_.offsets[p][k]);
+    }
 
     float load(uint32_t i) const {
         return std::atomic_ref<float>(const_cast<float&>(w_[i])).load(std::memory_order_relaxed);

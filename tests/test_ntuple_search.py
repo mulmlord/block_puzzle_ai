@@ -167,6 +167,30 @@ def test_depth3_matches_reference():
     check_against_reference(model, mid_game_states([11])[0], [2, 2])
 
 
+def test_q1_exact_for_every_piece_and_board():
+    """The search evaluates a child from its parent's lookups when no line clears (NTuple::child_eval): root Q1
+    must equal value() of the after-state bit for bit, for every piece, on boards from empty to nearly full."""
+    _, model = random_model()
+    rng = random.Random(7)
+    pieces = all_pieces()
+    clears = plain = 0
+    for density in (0.0, 0.2, 0.4, 0.6, 0.75):
+        for _ in range(3):
+            board = sum(1 << c for c in range(100) if rng.random() < density)
+            for first in range(0, len(pieces), 3):
+                pending = [(first + i) % len(pieces) for i in range(3)]
+                state = (board, pending, rng.randrange(30_000), [rng.choice([-1, 0, 5, 8, 10]), -1, -1])
+                q = ref_q1(model, G, *state)
+                got = scores(model, state, [0])
+                assert [(s, p, pts, q1) for s, p, pts, q1, _ in got] == [(m[0], m[1], m[2], m[5]) for m in q]
+                for m in q:
+                    if bin(m[3]).count("1") < bin(board).count("1") + len(pieces[pending[m[0]]].cells):
+                        clears += 1
+                    else:
+                        plain += 1
+    assert clears > 100 and plain > 1000
+
+
 def test_search_move_picks_max_and_tiers():
     _, model = random_model()
     for state in mid_game_states()[:5]:
@@ -247,6 +271,21 @@ def test_search_threads_independent():
     assert strip == [[*r[:7], r[8]] for r in eight]
     assert all(r[5][0] == r[2] for r in one)  # every move searched
     assert sum(r[6][0] for r in one) > 0
+
+
+def test_idle_threads_join_a_game():
+    """With fewer games than threads, idle threads take part of each search (Helpers): same games as one thread,
+    on both a depth-2 and a depth-3 tier, and faster."""
+    _, model = random_model()
+    tiers = [(INF, [3]), (60.0, [3, 2])]
+    t0 = time.perf_counter()
+    one = run_search(model, 3, 9, 300, 1, tiers)
+    t1 = time.perf_counter()
+    many = run_search(model, 3, 9, 300, 8, tiers)
+    t2 = time.perf_counter()
+    assert [[*r[:7], r[8]] for r in one] == [[*r[:7], r[8]] for r in many]
+    assert all(r[5][0] > 0 and r[5][1] > 0 for r in one)  # both tiers are used in every game
+    assert t2 - t1 < 0.8 * (t1 - t0)
 
 
 def test_skip_and_callback():
