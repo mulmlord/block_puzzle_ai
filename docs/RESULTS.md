@@ -786,7 +786,44 @@ Tried and dropped:
 - **Searching only root moves within δ of the best Q1.** The moves k = 4 picks are at most 109 below the best Q1 on 99% of moves (k = 4 changes the 1-ply move on 29% of moves). With δ = 200, the search keeps 3.87 of 4 moves on average.
 - **Incremental evaluation of line clears**: 4.6% of children clear a line, worth at most about 6%. Not done.
 
+### 1B acceptance
+
+Command (2026-11-06 23:25 – 2026-11-07 12:55; 24 threads, no `tfeval` running at launch):
+
+```bash
+uv run python -m block_puzzle_ai.ntuple evaluate --weights models/ntuple_v1.ntw --games 64 --seed 777 --max-moves 22000000 \
+  --threads 24 --search-k 4 --deep-below 92000 --deep-k 8,4 --games-file runs/accept1b/games.jsonl --json
+uv run python -m block_puzzle_ai.yardstick runs/accept1b/games.jsonl
+```
+
+Seed `777`, 64 games. "Clamped" counts each game at most 2³¹ − 1 = 2,147,483,647:
+
+| Search | Cap | Mean | Mean, clamped | Median | Min | Max | Moves / game over | Points / move | Alive at cap | Time |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| k = 2, [4, 2] below 92k (100M acceptance) | 10M | 365,777,118 | 365,777,118 | 320,815,295 | 5,749,560 | 984,183,190 | 3,774,622 | 98.4 | 1 | 3.51 h |
+| **k = 4, [8, 4] below 92k** | 22M | **1,164,852,934** | **1,149,503,618** | **1,070,481,810** | 46,680,120 | **2,229,751,750** | **14,148,484** | **101.3** | 12 | 13.5 h |
+
+- **The 1B goal is reached with both means.**
+  - Full scores: 1,164.9M, bootstrap 95% CI [985.7M, 1,345.2M].
+  - Clamped: 1,149.5M [975.4M, 1,324.2M].
+  - Both intervals reach just below 1B: 3.5% of the bootstrap resamples have a full mean below 1B, and 4.6% a clamped mean below 1B.
+- **35 of the 64 games scored over 1B, and 61 over 100M.**
+  - The 12 games alive at the 22M cap had all passed 2³¹, so the cap costs the clamped mean nothing.
+  - The high score is 2,229,751,750 (game 43, alive at the cap). The game itself would show at most 2,147,483,647.
+- **The death rate is 0.27 [0.18, 0.39] of the 100M acceptance's**: 52 game overs in 735.7M moves, against 63 in 237.8M.
+- **The split yardstick's projection held.**
+  - It projected 14.01M [9.11M, 24.19M] moves per game over; free play gave 14.15M [10.8M, 18.9M].
+  - At the 22M cap it projected 1,124M / 1,107M (full / clamped); the observed means are 1,165M / 1,150M.
+  - The risk does not grow with game age: the late half of the moves has 1.17 [0.68, 2.01] times the early half's death rate.
+- **Search:** k = 4 changed the 1-ply move on 28.7% of moves. The deep tier ran on 441,666 moves (0.060%) and changed the move on 58.6% of them.
+- **Time: 13.5 h, against the projected 10.9 h [9.8, 12.1].**
+  - The run used 1,586 µs of thread time per move, against 1,276 µs in the speed benchmark.
+  - The benchmark runs for seconds. Over hours, the laptop held all cores at about 3.2 GHz and 87 °C.
+  - The longest game took 9.9 h.
+
 ### Next methods, in order
 
-1. **The 1B acceptance**: `uv run python -m block_puzzle_ai.ntuple evaluate --weights models/ntuple_v1.ntw --games 64 --seed 777 --max-moves 22000000 --threads 24 --search-k 4 --deep-below 92000 --deep-k 8,4 --games-file runs/accept1b/games.jsonl --json`, with both means.
-2. **The value function**, if that is not enough. Danger shows only 1–2 moves ahead, and below 85k about 3.5% of visits are lost whatever the search does.
+The 1B goal is met. If the goal moves higher:
+1. **The value function.** Danger shows only 1–2 moves ahead, and below 85k about 3.5% of visits are lost whatever the search does. The 8-hour training run found its best weights after 62 minutes and did not improve over the remaining 6.5 hours, so stable training (temporal-coherence step sizes) comes first, then search-backed targets.
+2. **Points per move.** `rl_v2` gets 117 per move, against 101.3 here.
+3. **The clamp sets a ceiling.** The clamped mean cannot exceed 2,147.5M, and a game past about 21.2M moves counts as 2,147.5M however long it goes on. A clamped 1.5B would need about 28M moves per game over, twice today's.
