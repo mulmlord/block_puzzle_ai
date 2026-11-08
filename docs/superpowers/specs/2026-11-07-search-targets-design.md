@@ -35,6 +35,7 @@ The control is the TC pilot's `tc` arm: the same fine-tune with 1-ply targets.
 
 **Measurement.** The deployed agent searches, so the 1-ply evaluation is only a health check. For each arm's `latest.ntw` and for the control's, the split yardstick runs under the acceptance config (k = 4, [8, 4] below 92k): free play, capture and stage 2, about 45 minutes each on 24 workers. `ntuple_v1` has 14.01M [9.11M, 24.19M] moves per game over there.
 - The Q1 thresholds (85k, 92k) stay as they are. γ = 0.999 sets V's scale, so the thresholds keep their meaning across fine-tunes; the report states each arm's mean Q1 on ordinary moves.
+  - **Wrong, found in the pilot:** every fine-tune's Q1 is `ntuple_v1`'s plus a near-constant shift (+1.3k to +12.9k), so the fixed tiers sat deeper in danger. The pilot was measured again with every tier shifted by each arm's median shift (`split_yardstick.py --shift`); see `docs/RESULTS.md`, "Search-backed targets pilot".
 - Different weights play different games, so comparisons between weights are unpaired, with intervals of about ×/÷ 1.5.
 
 **Bar.** An arm earns a longer run if its death rate relative to the control has a 95% interval below 1. A better point estimate whose interval includes 1 is inconclusive.
