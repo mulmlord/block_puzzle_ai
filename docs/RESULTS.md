@@ -827,3 +827,93 @@ The 1B goal is met. If the goal moves higher:
 1. **The value function.** Danger shows only 1–2 moves ahead, and below 85k about 3.5% of visits are lost whatever the search does. The 8-hour training run found its best weights after 62 minutes and did not improve over the remaining 6.5 hours, so stable training (temporal-coherence step sizes) comes first, then search-backed targets.
 2. **Points per move.** `rl_v2` gets 117 per move, against 101.3 here.
 3. **The clamp sets a ceiling.** The clamped mean cannot exceed 2,147.5M, and a game past about 21.2M moves counts as 2,147.5M however long it goes on. A clamped 1.5B would need about 28M moves per game over, twice today's.
+
+## Value function (ticket #10)
+
+### Temporal-coherence pilot
+
+**Method.** Temporal coherence (Beal & Smith 1999; Jaśkowski 2018 for 2048 n-tuple networks) gives every weight its own step size:
+- E sums the steps the weight was asked to take, and A their sizes.
+- Each step is scaled by |E| / A: 1 while the steps agree in sign, and towards 0 while they cancel.
+
+`ntuple train --tc` keeps (E, A) as doubles per weight and saves them in checkpoints. `--init` starts a new run from a checkpoint's weights.
+
+**Runs** (2026-11-07, 15:26–16:58, `runs/tc_pilot/run.sh`). Both arms fine-tuned `models/ntuple_v1.ntw` for 1.5 h, side by side on 12 threads each. Both used the 24-thread runs' step-size cap of 0.0208 and the collapse guard. The evaluation is the periodic one (256 games, seed `2024`, 200,000-move cap); on it, `ntuple_v1` gave 70,785 moves per game over and 94.0 points per move.
+
+```bash
+common="--init models/ntuple_v1.ntw --hours 1.5 --threads 12 --alpha 0.0208 --eval-minutes 15"
+uv run python -m block_puzzle_ai.ntuple train --out runs/tc_pilot/plain $common
+uv run python -m block_puzzle_ai.ntuple train --out runs/tc_pilot/tc $common --tc
+```
+
+| Arm | Rollbacks | Cap at the end | Moves | Moves / game over at 17 / 34 / 52 / 68 / 85 / 92 min | Mean of the 6 | Points / move |
+|---|---:|---:|---:|---|---:|---:|
+| Plain TD | 3 (at 38M, 69M and 95M moves) | 0.0026 | 647M | 84.4k / 80.4k / 88.6k / 73.0k / 75.9k / 86.8k | 81.5k | 91.8–94.6 |
+| **TC** | **0** | 0.0208 | 633M | 82.7k / 78.3k / 83.8k / 79.2k / 73.4k / 77.3k | 79.1k | 93.6–94.5 |
+
+- **TC keeps training stable at the full step size.**
+  - Plain TD collapsed three times in its first 16 minutes. Each time the guard restored older weights and halved the cap, from 0.0208 to 0.0026.
+  - TC ran all 90 minutes at 0.0208 without a rollback.
+- **It trains no better.** The two arms are level, and both are about 10% above `ntuple_v1`. One evaluation's interval is ×/÷ 1.14, and neither arm's points per move moved.
+- **Fine-tuning has reached what these tuples can represent,** so step sizes are not the limit. The next lever is the target: train the value towards what the search finds.
+
+### Search-backed targets pilot
+
+**Method** (`docs/superpowers/specs/2026-11-07-search-targets-design.md`). At every state it reaches, the trainer runs the depth-2 search on the top 2 moves (`--target-k 2`) and trains towards its scores:
+- the previous after-state towards the best search score, which looks one spawn further ahead than a 1-ply target;
+- each searched move's after-state towards its exact expectation over the next spawn.
+
+Arm S plays the 1-ply move. Arm SP plays the searched move (`--play-search`), as the deployed agent does. Both fine-tuned `models/ntuple_v1.ntw` with TC and the TC pilot's settings, side by side for 2 h on 12 threads each (2026-11-07, 17:27–19:28, `runs/st_pilot/run.sh`). The control is the TC pilot's `tc` arm: the same fine-tune with 1-ply targets.
+
+```bash
+common="--init models/ntuple_v1.ntw --hours 2 --threads 12 --alpha 0.0208 --eval-minutes 15 --tc --target-k 2"
+uv run python -m block_puzzle_ai.ntuple train --out runs/st_pilot/S $common
+uv run python -m block_puzzle_ai.ntuple train --out runs/st_pilot/SP $common --play-search
+```
+
+**Training.** The deployed agent searches, so the periodic 1-ply evaluation is only a health check.
+
+| Arm | Moves | Moves / s | Game overs in training | Rollbacks | 1-ply moves / game over, every ~15 min | Mean | Points / move |
+|---|---:|---:|---:|---:|---|---:|---:|
+| Control (1.5 h) | 633M | 132k | 8,103 | 0 | 82.7k / 78.3k / 83.8k / 79.2k / 73.4k / 77.3k | 79.1k | 93.6–94.5 |
+| S | 124M | 18k | 5,074 | 0 | 50.9k / 40.8k / 28.7k / 11.1k / 52.1k / 58.2k / 44.3k / 36.8k | 40.4k | 81.9–94.7 |
+| SP | 120M | 17k | 406 | 0 | 26.7k / 29.0k / 26.3k / 24.9k / 21.3k / 21.6k / 21.1k / 21.6k | 24.1k | 94.7–99.8 |
+
+- Search targets train at about 1/7 of the moves per second.
+- **Both arms got worse at 1-ply.** S lost half of the control's moves per game over, SP 70%, and SP kept falling.
+- SP's training had 12× fewer game overs than S's in about as many moves, so it also had 12× fewer restarts near game overs.
+
+**The fine-tunes shift Q1.** On the same states, each fine-tune's best Q1 is `ntuple_v1`'s plus a nearly constant amount (`runs/st_pilot/q1_shift.py`: 1,000 states from `ntuple_v1`'s 1-ply play, and 1,000 of its 92k entry states from the k = 4 free play).
+
+| Weights | Shift on ordinary states: median [p10, p90] | Shift on 92k entry states: median [p10, p90] |
+|---|---|---|
+| Control | +1,236 [+1,207, +1,272] | +1,315 [+1,245, +1,403] |
+| S | +4,732 [+4,674, +4,804] | +4,880 [+4,368, +5,048] |
+| SP | +12,952 [+12,885, +13,030] | +12,947 [+12,724, +13,858] |
+
+- A constant barely changes the moves: all moves' Q1 and search scores move together, and only children with no legal move, which stay at 0, look worse by it.
+- **It moves the danger tiers.** `ntuple_v1`'s median Q1 on ordinary states is 92,581, only 581 above the 92k tier. Shifted by 1.3k–12.9k, the fine-tunes entered Q1 < 92k 15–90 times less often, so the deep search ran only in deeper danger.
+- So the spec's assumption that the thresholds keep their meaning across fine-tunes was wrong. `split_yardstick.py --shift D` adds D to every tier threshold. Each arm was measured again with D = its median shift on the entry states (2026-11-08, 00:23–03:09, `runs/st_pilot/calib.sh`).
+
+**Yardstick** (k = 4, [8, 4] below 92k; free play seed `31`, capture `32`, stage 2 `41`; `runs/st_pilot/yard_*` with fixed tiers, `yardc_*` shifted).
+- Different weights play different games, so the ratios are unpaired: independent bootstraps (`runs/st_pilot/st_compare.py`).
+- The `ntuple_v1` row is the acceptance config's split estimate from "Search below 92k on top of k = 4".
+- q1 here is the chance of falling below 85k. With fixed tiers, S and SP also had game overs without falling below 85k (0.79% and 5.3% of restarts), which the moves per game over include.
+
+| Weights | Tiers | Points / move | e1 per move | q1 | p2 | Moves / game over | Death rate vs control | Mean, no cap (full / clamped) |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| `ntuple_v1` | fixed | 101.3 | 3.29e-4 | 0.571% | 3.80% | 14.01M [9.11M, 24.19M] | | 1,420.2M / 1,107.1M |
+| Control | fixed | 102.0 | 2.20e-5 | 8.13% | 12.1% | 4.64M [2.76M, 9.79M] | 1 | 473.2M / 468.1M |
+| S | fixed | 100.9 | 8.54e-6 | 17.9% | 7.61% | 5.44M [3.74M, 8.93M] | 0.85 [0.42, 1.99] | 548.7M / 537.7M |
+| SP | fixed | 108.3 | 3.75e-6 | 55.4% | 23.6% | 1.45M [0.99M, 2.38M] | 3.20 [1.55, 7.50] | 157.2M / 157.2M |
+| Control | +1,315 | 102.1 | 3.96e-4 | 0.430% | 4.01% | 14.66M [8.26M, 29.96M] | 1 | 1,495.7M / 1,139.8M |
+| S | +4,880 | 100.9 | 1.47e-3 | 0.234% | 3.39% | 8.53M [6.58M, 11.53M] | **1.72 [0.92, 3.64]** | 861.1M / 790.0M |
+| SP | +12,947 | 108.3 | 5.53e-4 | 0.940% | 8.84% | 2.00M [1.62M, 2.54M] | **7.34 [4.05, 15.38]** | 216.4M / 216.4M |
+
+- **Search-backed targets don't help the searched agent.** With shifted tiers, S's death rate is 1.72 [0.92, 3.64] times the control's and SP's 7.34 [4.05, 15.38] times. Neither meets the bar, and SP is clearly worse.
+  - S's shifted 92k tier fired 3.7 times as often as the control's, so S got more deep search and still died more often.
+- **SP trades safety for points.** It learns the value of its own searched play: 108.3 points per move against the control's 102.1 (+6%), at 7 times the death rate. A likely cause is its training, which rarely reached game overs.
+- **1-ply gains don't carry over to the search.** The control, about 10% better than `ntuple_v1` at 1-ply, is level with it under the deployed search: death rate 0.96 [0.41, 2.05].
+- **Comparing weights needs shifted tiers.** With fixed tiers the control looked 3.02 [1.24, 6.72] times worse than `ntuple_v1`. Comparisons between weights now use `--shift` with the median Q1 shift on `ntuple_v1`'s 92k entry states.
+- Check against free play: with shifted tiers, the three arms had 2, 1 and 6 game overs, where the split predicts 0.66, 1.12 and 4.80.
+- **Neither the step size (TC pilot) nor the target moved the searched agent's death rate.** Fine-tuning these tuples has stopped paying off. What remains for the value is the representation: more or larger tuples.

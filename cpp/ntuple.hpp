@@ -246,6 +246,42 @@ public:
         }
     }
 
+    // Temporal-coherence step sizes (Beal & Smith 1999; Jaskowski 2018 for 2048 n-tuple networks). Per weight,
+    // E sums the steps it was asked to take and A their sizes, so |E| / A is 1 while the steps agree in sign and
+    // falls towards 0 while they cancel. Stored as (E, A) pairs of doubles: a float A stops growing once it is
+    // 2^24 steps, after a few million moves for the fit weights read on every move.
+    void enable_tc() {
+        if (tc_.empty()) tc_.assign(2 * w_.size(), 0.0);
+    }
+    bool tc_enabled() const { return !tc_.empty(); }
+    double* tc_state() { return tc_.data(); }
+
+    // TD step with temporal-coherence rates: with delta = (target - V(a)) / n_lookups, each looked-up weight
+    // moves by alpha * rate * delta, rate = |E| / A (1 while A is 0), then E += delta and A += |delta|.
+    void update_tc(const Afterstate& a, double target, float alpha) {
+        uint32_t idx[MAX_LOOKUPS];
+        const int n = lookups(a, idx);
+        double v = 0;
+        for (int k = 0; k < n; k++) v += load(idx[k]);
+        const double delta = (target - v) / n;
+        constexpr auto relaxed = std::memory_order_relaxed;
+        for (int k = 0; k < n; k++) {
+            std::atomic_ref<float> w(w_[idx[k]]);
+            std::atomic_ref<double> e(tc_[2 * size_t{idx[k]}]), s(tc_[2 * size_t{idx[k]} + 1]);
+            const double E = e.load(relaxed), A = s.load(relaxed);
+            const double rate = A > 0 ? std::abs(E) / A : 1.0;
+            w.store(w.load(relaxed) + static_cast<float>(alpha * rate * delta), relaxed);
+            e.store(E + delta, relaxed);
+            s.store(A + std::abs(delta), relaxed);
+        }
+    }
+
+    // update_tc once TC is enabled, update otherwise
+    void learn(const Afterstate& a, double target, float alpha) {
+        if (tc_enabled()) update_tc(a, target, alpha);
+        else update(a, target, alpha);
+    }
+
 private:
     struct Mask {
         uint64_t lo, hi;
@@ -260,6 +296,7 @@ private:
     std::vector<Mask> masks_;
     uint32_t fit_offset_ = 0, rem_offset_ = 0;
     std::vector<float> w_;
+    std::vector<double> tc_;  // temporal coherence: (E, A) per weight, empty until enable_tc
     // child_eval's tables
     Board piece_sym_[MAX_PIECES][8] = {};  // each piece at position 0 under the 8 symmetries
     int sym_shift_[CELLS][8] = {};  // moving a piece from 0 to pos translates its image: shift(piece_sym_, this)
@@ -401,132 +438,6 @@ inline std::vector<uint64_t> stream_seeds(uint64_t seed, size_t n) {
     for (uint64_t& s : out) s = splitmix64(seed);
     return out;
 }
-
-struct TrainStats {
-    uint64_t moves = 0;
-    double seconds = 0;
-    uint64_t games = 0, deaths = 0, fresh_games = 0, restarts = 0;
-    double fresh_score_sum = 0, fresh_moves_sum = 0, value_sum = 0;
-
-    double mean_score() const { return fresh_games ? fresh_score_sum / fresh_games : 0; }
-    double mean_moves() const { return fresh_games ? fresh_moves_sum / fresh_games : 0; }
-    double value_mean() const { return moves ? value_sum / moves : 0; }
-};
-
-// Lock-free multithreaded TD(0) on after-states with restarts near game overs. Every thread keeps its game,
-// snapshot ring, restart pool and random stream across run() calls, so long games continue between chunks.
-class Trainer {
-public:
-    static constexpr int SNAPSHOT_EVERY = 50, RING = 10, POOL = 4096;
-    static constexpr int64_t POOL_WINDOW = 500;
-
-    Trainer(NTuple& nt, float gamma, float alpha, double restart_frac, int threads, uint64_t seed)
-        : alpha(alpha), nt_(nt), gamma_(gamma), restart_frac_(restart_frac) {
-        if (threads < 1) throw std::invalid_argument("threads must be >= 1");
-        if (restart_frac < 0 || restart_frac > 1) throw std::invalid_argument("restart_frac must be in [0, 1]");
-        for (uint64_t s : stream_seeds(seed, threads)) workers_.emplace_back(s);
-    }
-
-    float alpha;
-
-    TrainStats run(uint64_t moves) {
-        const auto n = static_cast<uint64_t>(workers_.size());
-        std::vector<TrainStats> per(n);
-        const auto start = std::chrono::steady_clock::now();
-        parallel(static_cast<int>(n), [&](int i) { per[i] = work(workers_[i], moves / n + (i < moves % n)); });
-        TrainStats total;
-        total.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-        for (const TrainStats& st : per) {
-            total.moves += st.moves, total.games += st.games, total.deaths += st.deaths;
-            total.fresh_games += st.fresh_games, total.restarts += st.restarts;
-            total.fresh_score_sum += st.fresh_score_sum, total.fresh_moves_sum += st.fresh_moves_sum;
-            total.value_sum += st.value_sum;
-        }
-        return total;
-    }
-
-private:
-    struct Snapshot {
-        State s;
-        uint64_t game = 0;
-    };
-    struct Worker {
-        explicit Worker(uint64_t seed) : rng(seed) {}
-        Xoshiro256 rng;
-        State s;
-        Choice choice;  // the move chosen in s
-        bool started = false, fresh = true;
-        uint64_t game = 0, steps = 0;
-        Snapshot ring[RING];
-        int ring_size = 0, ring_head = 0;
-        std::vector<State> pool;
-        size_t pool_head = 0;
-    };
-
-    NTuple& nt_;
-    float gamma_;
-    double restart_frac_;
-    std::vector<Worker> workers_;
-
-    void new_game(Worker& w, TrainStats& st) {
-        const Tables& t = nt_.tables();
-        w.game++;
-        w.ring_size = w.ring_head = 0;
-        const bool from_pool = !w.pool.empty() && w.rng.randrange(1u << 30) < restart_frac_ * (1u << 30);
-        if (from_pool) {
-            w.s = w.pool[w.rng.randrange(static_cast<uint32_t>(w.pool.size()))];
-            st.restarts++;
-        } else {
-            reset(t, w.s, w.rng);
-        }
-        w.fresh = !from_pool;
-        if (!best_move(nt_, w.s, gamma_, w.choice)) {  // unreachable (pool states have a legal move), but never play a stale move
-            reset(t, w.s, w.rng);
-            w.fresh = true;
-            best_move(nt_, w.s, gamma_, w.choice);  // an empty board always fits a piece
-        }
-        check_finite(w.choice.q);
-    }
-
-    void game_over(Worker& w, TrainStats& st) {
-        st.games++, st.deaths++;
-        if (w.fresh) st.fresh_games++, st.fresh_score_sum += w.s.score, st.fresh_moves_sum += w.s.moves;
-        for (int k = 0; k < w.ring_size; k++) {
-            const Snapshot& snap = w.ring[k];
-            if (snap.game != w.game || snap.s.moves < w.s.moves - POOL_WINDOW) continue;
-            if (w.pool.size() < POOL) w.pool.push_back(snap.s);
-            else w.pool[w.pool_head] = snap.s, w.pool_head = (w.pool_head + 1) % POOL;
-        }
-    }
-
-    TrainStats work(Worker& w, uint64_t moves) {
-        const Tables& t = nt_.tables();
-        TrainStats st;
-        if (!w.started) new_game(w, st), w.started = true;
-        for (uint64_t m = 0; m < moves; m++) {
-            const Afterstate a = w.choice.after;
-            step(t, w.s, w.choice.slot, w.choice.pos, w.rng);
-            Choice next;
-            if (best_move(nt_, w.s, gamma_, next)) {
-                check_finite(next.q);
-                if (w.steps++ % SNAPSHOT_EVERY == 0) {  // only states with a legal move may become restart states
-                    w.ring[w.ring_head] = {w.s, w.game};
-                    w.ring_head = (w.ring_head + 1) % RING;
-                    w.ring_size = std::min(w.ring_size + 1, RING);
-                }
-                nt_.update(a, next.q, alpha);
-                w.choice = next;
-            } else {
-                nt_.update(a, 0.0, alpha);
-                game_over(w, st);
-                new_game(w, st);
-            }
-            st.value_sum += w.choice.v;
-        }
-        st.moves = moves;
-        return st;
-    }
-};
 
 struct GameOutcome {
     int64_t score = 0, moves = 0, lines = 0;

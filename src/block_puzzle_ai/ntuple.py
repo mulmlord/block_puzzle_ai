@@ -131,14 +131,28 @@ class NTupleConfig:
     restart_frac: float = 0.5
     threads: int = 24
     seed: int = 0
+    tc: bool = False  # temporal-coherence step sizes per weight; alpha is then the meta step size
+    target_k: int = 0  # search-backed targets with depth 2 on the top K moves (0: the next state's best Q1)
+    play_search: bool = False  # with target_k, play the searched move instead of the 1-ply move
+    init: str | None = None  # the checkpoint a run started from, if not from zero weights
 
 
 def save_checkpoint(
-    path: str | Path, cfg: NTupleConfig, tuples: list[list[int]], weights: np.ndarray, moves_trained: int, elapsed_min: float
+    path: str | Path,
+    cfg: NTupleConfig,
+    tuples: list[list[int]],
+    weights: np.ndarray,
+    moves_trained: int,
+    elapsed_min: float,
+    tc: np.ndarray | None = None,
 ) -> None:
-    """MAGIC, uint32 JSON length, JSON header, raw float32 weights; written to path.tmp, then renamed."""
+    """MAGIC, uint32 JSON length, JSON header, raw float32 weights, then the raw float64 (E, A) pairs of
+    temporal coherence if given; written to path.tmp, then renamed."""
     path = Path(path)
     weights = np.ascontiguousarray(weights, dtype=np.float32)
+    tc = None if tc is None else np.ascontiguousarray(tc, dtype=np.float64)
+    if tc is not None and tc.shape != (len(weights), 2):
+        raise ValueError(f"tc state has shape {tc.shape}, expected ({len(weights)}, 2)")
     header = json.dumps(
         {
             "config": asdict(cfg),
@@ -147,11 +161,14 @@ def save_checkpoint(
             "elapsed_min": elapsed_min,
             "n_weights": len(weights),
         }
+        | ({} if tc is None else {"tc": True})
     ).encode()
     tmp = path.with_name(path.name + ".tmp")
     with tmp.open("wb") as f:
         f.write(MAGIC + struct.pack("<I", len(header)) + header)
         f.write(weights.tobytes())
+        if tc is not None:
+            f.write(tc.tobytes())
     tmp.replace(path)
 
 
@@ -161,10 +178,17 @@ def load_checkpoint(path: str | Path) -> tuple[NTupleConfig, list[list[int]], np
         raise ValueError(f"{path}: not an n-tuple checkpoint (bad magic)")
     (n,) = struct.unpack("<I", raw[8:12])
     header = json.loads(raw[12 : 12 + n])
-    weights = np.frombuffer(raw[12 + n :], dtype=np.float32) if (len(raw) - 12 - n) % 4 == 0 else np.empty(0)
-    if len(weights) != header["n_weights"]:
-        raise ValueError(f"{path}: {len(weights)} weights, header says {header['n_weights']}")
-    meta = {"moves_trained": header["moves_trained"], "elapsed_min": header["elapsed_min"]}
+    body, nw = raw[12 + n :], header["n_weights"]
+    tc = None
+    if header.get("tc"):
+        if len(body) != 20 * nw:
+            raise ValueError(f"{path}: {len(body)} bytes of weights and tc state, header says {nw} weights")
+        tc = np.frombuffer(body[4 * nw :], dtype=np.float64).reshape(nw, 2)
+        body = body[: 4 * nw]
+    weights = np.frombuffer(body, dtype=np.float32) if len(body) % 4 == 0 else np.empty(0)
+    if len(weights) != nw:
+        raise ValueError(f"{path}: {len(weights)} weights, header says {nw}")
+    meta = {"moves_trained": header["moves_trained"], "elapsed_min": header["elapsed_min"], "tc": tc}
     return NTupleConfig(**header["config"]), header["tuples"], weights, meta
 
 
@@ -174,6 +198,9 @@ def load_model(path: str | Path) -> tuple[_engine.NTuple, NTupleConfig, dict]:
     if model.n_weights != len(weights):
         raise ValueError(f"{path}: {len(weights)} weights, its tuples need {model.n_weights}")
     model.weights[:] = weights
+    if meta["tc"] is not None:
+        model.enable_tc()
+        model.tc_state[:] = meta["tc"]
     return model, cfg, meta
 
 
@@ -229,8 +256,12 @@ def _best_so_far(metrics: Path) -> float:
 def train(args: argparse.Namespace) -> None:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    names = ("alpha", "alpha_k", "restart_frac", "threads", "seed")
+    names = ("alpha", "alpha_k", "restart_frac", "threads", "seed", "target_k")
     overrides = {k: getattr(args, k) for k in names if getattr(args, k) is not None}
+    if args.tc:
+        overrides["tc"] = True
+    if args.play_search:
+        overrides["play_search"] = True
     if args.resume:
         model, cfg, meta = load_model(out / "latest.ntw")
         if args.shapes is not None and args.shapes.split(",") != cfg.shapes:
@@ -239,6 +270,16 @@ def train(args: argparse.Namespace) -> None:
             raise SystemExit(f"--resume: the run uses gamma {cfg.gamma}; it cannot change")
         cfg = NTupleConfig(**(asdict(cfg) | overrides))
         moves, elapsed0 = meta["moves_trained"], meta["elapsed_min"]
+    elif args.init:
+        model, cfg, _ = load_model(args.init)
+        if args.shapes is not None and args.shapes.split(",") != cfg.shapes:
+            raise SystemExit(f"--init: {args.init} uses shapes {cfg.shapes}; they cannot change")
+        if args.gamma is not None and args.gamma != cfg.gamma:
+            raise SystemExit(f"--init: {args.init} uses gamma {cfg.gamma}; it cannot change")
+        cfg = NTupleConfig(**(asdict(cfg) | overrides | {"init": str(args.init)}))
+        if args.alpha is None:  # the source run's cap may have been halved by rollbacks; start from the default
+            cfg.alpha = min(0.1, 0.5 / cfg.threads)
+        moves, elapsed0 = 0, 0.0
     else:
         base = {"shapes": args.shapes.split(",")} if args.shapes else {}
         if args.gamma is not None:
@@ -248,13 +289,25 @@ def train(args: argparse.Namespace) -> None:
             cfg.alpha = min(0.1, 0.5 / cfg.threads)
         model = make_model(shapes_to_tuples(cfg.shapes))
         moves, elapsed0 = 0, 0.0
+    if cfg.tc:
+        model.enable_tc()  # keeps a loaded state; from zero otherwise
     tuples = [list(t) for t in model.tuples]
+
+    def tc_state() -> np.ndarray | None:
+        return model.tc_state if model.tc_enabled else None
+
+    def snapshot() -> tuple[np.ndarray, np.ndarray | None]:
+        tc = tc_state()
+        return model.weights.copy(), None if tc is None else tc.copy()
     # mixing in the moves so far gives a resumed run fresh random streams
-    trainer = _engine.Trainer(model, cfg.gamma, 0.0, cfg.restart_frac, cfg.threads, cfg.seed + moves)
+    if cfg.target_k < 0 or (cfg.play_search and cfg.target_k == 0):
+        raise SystemExit("--target-k must be >= 1 for search-backed targets, and --play-search needs it")
+    widths = [cfg.target_k] if cfg.target_k else []
+    trainer = _engine.Trainer(model, cfg.gamma, 0.0, cfg.restart_frac, cfg.threads, cfg.seed + moves, widths, cfg.play_search)
     probe = trainer.run(1000 * cfg.threads)  # alpha 0: measures V before the first learning chunk; not counted
     trainer.alpha = scheduled_alpha(cfg.alpha, cfg.alpha_k, probe["value_mean"])
     guard = CollapseGuard()
-    snapshots: deque[np.ndarray] = deque([model.weights.copy()], maxlen=3)
+    snapshots: deque[tuple[np.ndarray, np.ndarray | None]] = deque([snapshot()], maxlen=3)
     metrics = (out / "metrics.jsonl").open("a")
     best = _best_so_far(out / "metrics.jsonl")
     start = time.perf_counter()
@@ -276,9 +329,9 @@ def train(args: argparse.Namespace) -> None:
         summary = summarize(results)
         improved = summary["moves_per_death"] > best
         best = max(best, summary["moves_per_death"])
-        save_checkpoint(out / "latest.ntw", cfg, tuples, model.weights, moves, elapsed())
+        save_checkpoint(out / "latest.ntw", cfg, tuples, model.weights, moves, elapsed(), tc_state())
         if improved:
-            save_checkpoint(out / "best.ntw", cfg, tuples, model.weights, moves, elapsed())
+            save_checkpoint(out / "best.ntw", cfg, tuples, model.weights, moves, elapsed(), tc_state())
         log({"type": "eval"} | {f"eval_{k}": v for k, v in summary.items()} | {"best_eval_moves_per_death": best})
         print(
             f"[eval] {moves:,} moves, {elapsed():.1f} min: mean {summary['mean']:,.0f}, "
@@ -301,7 +354,10 @@ def train(args: argparse.Namespace) -> None:
             log({"type": "train", "moves_per_s": round(rate)} | {k: st[k] for k in keys} | {"alpha": trainer.alpha})
             print(f"[train] {moves:,} moves, {rate:,.0f}/s, games {st['games']}, mean {st['mean_score']:,.0f}", flush=True)
             if guard.check(st["deaths"], st["moves"], st["value_mean"]):
-                model.weights[:] = snapshots[0]
+                weights, tc = snapshots[0]
+                model.weights[:] = weights
+                if tc is not None:
+                    model.tc_state[:] = tc
                 snapshots = deque([snapshots[0]], maxlen=3)
                 cfg.alpha /= 2
                 log({"type": "rollback", "deaths": st["deaths"], "value_mean": st["value_mean"], "alpha_cap": cfg.alpha})
@@ -309,14 +365,14 @@ def train(args: argparse.Namespace) -> None:
                 healthy_v = max((v for _, v in guard.history), default=st["value_mean"])
                 trainer.alpha = scheduled_alpha(cfg.alpha, cfg.alpha_k, healthy_v)
             else:
-                snapshots.append(model.weights.copy())
+                snapshots.append(snapshot())
                 trainer.alpha = scheduled_alpha(cfg.alpha, cfg.alpha_k, st["value_mean"])
             if elapsed() - last_eval >= args.eval_minutes:
                 evaluate_and_save()
                 last_eval = elapsed()
         evaluate_and_save()
     except KeyboardInterrupt:
-        save_checkpoint(out / "latest.ntw", cfg, tuples, model.weights, moves, elapsed())
+        save_checkpoint(out / "latest.ntw", cfg, tuples, model.weights, moves, elapsed(), tc_state())
         print(f"interrupted: saved {out / 'latest.ntw'} at {moves:,} moves", flush=True)
     finally:
         metrics.close()
@@ -352,7 +408,13 @@ def main(argv: list[str] | None = None) -> None:
     stop = t.add_mutually_exclusive_group(required=True)
     stop.add_argument("--hours", type=float, help="stop at this much training time, counting resumed runs")
     stop.add_argument("--total-moves", type=int, help="stop at this many training moves, counting resumed runs")
-    t.add_argument("--resume", action="store_true", help="continue from OUT/latest.ntw")
+    start = t.add_mutually_exclusive_group()
+    start.add_argument("--resume", action="store_true", help="continue from OUT/latest.ntw")
+    start.add_argument("--init", help="start a new run from this checkpoint's weights, shapes and gamma")
+    t.add_argument("--tc", action="store_true", help="temporal-coherence step sizes per weight (ALPHA is the meta step size)")
+    t.add_argument("--target-k", type=int, help="search-backed targets: depth 2 on the top K moves at every state "
+                   "(docs/superpowers/specs/2026-11-07-search-targets-design.md)")
+    t.add_argument("--play-search", action="store_true", help="with --target-k, play the searched move (default: the 1-ply move)")
     t.add_argument("--shapes", help="comma-separated tuple shapes (default window4,line)")
     t.add_argument("--gamma", type=float)
     t.add_argument("--alpha", type=float, help="step-size cap (default min(0.1, 0.5 / threads))")

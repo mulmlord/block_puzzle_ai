@@ -18,6 +18,9 @@ estimates q1 x p2 in one stage. Results and validation: docs/RESULTS.md, "Yardst
     uv run python scripts/split_yardstick.py roll DIR --arm A --reps 10 --seed 41 --states DIR/roll_32.json --tag _s2_A
     uv run python scripts/split_estimate.py DIR DIR/roll_32.json DIR/roll_41_s2_A.json [DIR/roll_41_s2_B.json ...]
 
+--weights WEIGHTS runs any mode with another checkpoint (default models/ntuple_v1.ntw). --shift D adds D to every
+tier threshold (92k, 85k, ...), for weights whose Q1 is ntuple_v1's plus a constant.
+
 Arms are the acceptance config (k = 2 on every move, [4, 2] below 92k) with other widths on every move (k3, k4),
 below 92k (k4b8, k4b16) or below 85k. The 75k and 65k tiers only label the Q1 band.
 """
@@ -36,6 +39,7 @@ from block_puzzle_ai.engine import cpp_tables
 from block_puzzle_ai.ntuple import load_model
 
 WEIGHTS = "models/ntuple_v1.ntw"
+SHIFT = 0.0
 INF = math.inf
 def arm(widths, k=2, danger=(4, 2)):
     """k on every move, ``danger`` below 92k and ``widths`` below 85k."""
@@ -46,6 +50,16 @@ ARMS = {"accept": arm([4, 2]), "d4": arm([4, 2, 2]), "w8": arm([8, 4]), "w8d4": 
         "k3": arm([4, 2], 3), "k4": arm([4, 2], 4), "k4b8": arm([8, 4], 4, (8, 4)), "k4b16": arm([16, 8], 4, (16, 8))}
 TIERS = ARMS["accept"]
 _M = {}
+
+
+def use_weights(path, shift=0.0):
+    global WEIGHTS, SHIFT
+    WEIGHTS, SHIFT = path, shift
+
+
+def arm_tiers(name):
+    """The arm's tiers with SHIFT added to every finite threshold."""
+    return [(below + SHIFT if below != INF else below, widths) for below, widths in ARMS[name]]
 
 
 def model():
@@ -66,7 +80,7 @@ def state_of(g):
 def free(args):
     """One worker's free play: entries into Q1 < 92k counted (and their states kept) after ``burn`` moves."""
     seed, burn, total, arm_name = args
-    tiers = ARMS[arm_name]
+    tiers = arm_tiers(arm_name)
     m, gamma, T = model()
     rng = random.Random(seed)
     g = _engine.Game(T, rng.getrandbits(64), True)
@@ -104,7 +118,7 @@ def roll(args):
     first decision below 85k instead and returns that state (2, ..., state)."""
     idx, state, seeds, arm_name, capture = args
     m, gamma, T = model()
-    tiers = ARMS[arm_name]
+    tiers = arm_tiers(arm_name)
     out = []
     for s in seeds:
         g = _engine.Game(T, s, True)
@@ -141,13 +155,15 @@ def main():
     p.add_argument("--states", help="restart from the states captured in this roll file instead of free.json")
     p.add_argument("--limit", type=int, help="only the first N states")
     p.add_argument("--tag", default="", help="suffix of the output file")
+    p.add_argument("--weights", default=WEIGHTS, help="n-tuple checkpoint (default %(default)s)")
+    p.add_argument("--shift", type=float, default=0.0, help="add this to every tier threshold")
     a = p.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
     if a.mode == "free":
         jobs = [(a.seed * 1000 + w, a.burn, a.moves, a.arm) for w in range(a.workers)]
-        with Pool(a.workers) as pool:
+        with Pool(a.workers, initializer=use_weights, initargs=(a.weights, a.shift)) as pool:
             res = pool.map(free, jobs)
         (out / "free.json").write_text(json.dumps(res))
         n = sum(r["counted"] for r in res)
@@ -167,7 +183,7 @@ def main():
         rng = random.Random(a.seed)
         jobs = [(i, s, [rng.getrandbits(64) for _ in range(a.reps)], a.arm, a.capture) for i, s in enumerate(states)]
         rows = [None] * len(jobs)
-        with Pool(a.workers) as pool:
+        with Pool(a.workers, initializer=use_weights, initargs=(a.weights, a.shift)) as pool:
             for k, (i, o) in enumerate(pool.imap_unordered(roll, jobs, chunksize=4)):
                 rows[i] = o
                 if k % 500 == 0:

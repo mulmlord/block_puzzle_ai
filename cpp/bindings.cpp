@@ -15,6 +15,7 @@
 #include "ntuple.hpp"
 #include "rng.hpp"
 #include "search.hpp"
+#include "trainer.hpp"
 
 namespace nb = nanobind;
 using bpa::Tables;
@@ -215,11 +216,31 @@ NB_MODULE(_engine, m) {
             [](bpa::NTuple& n, uint64_t lo, uint64_t hi, const std::vector<int>& remaining, bool cooldown, double target,
                float alpha) { n.update(make_afterstate(n.tables(), lo, hi, remaining, cooldown), target, alpha); },
             nb::arg("board_lo"), nb::arg("board_hi"), nb::arg("remaining"), nb::arg("cooldown"), nb::arg("target"),
-            nb::arg("alpha"), "TD step: each looked-up weight += alpha * (target - V) / n_lookups");
+            nb::arg("alpha"), "TD step: each looked-up weight += alpha * (target - V) / n_lookups")
+        .def("enable_tc", &bpa::NTuple::enable_tc, "allocate temporal-coherence state; the trainer then uses update_tc")
+        .def_prop_ro("tc_enabled", &bpa::NTuple::tc_enabled)
+        .def_prop_ro(
+            "tc_state",
+            [](bpa::NTuple& n) {
+                if (!n.tc_enabled()) throw std::runtime_error("temporal coherence is not enabled");
+                return nb::ndarray<nb::numpy, double, nb::ndim<2>>(n.tc_state(), {n.n_weights(), 2}, nb::handle());
+            },
+            nb::rv_policy::reference_internal, "writable float64 view of the (E, A) pair per weight")
+        .def(
+            "update_tc",
+            [](bpa::NTuple& n, uint64_t lo, uint64_t hi, const std::vector<int>& remaining, bool cooldown, double target,
+               float alpha) {
+                if (!n.tc_enabled()) throw std::runtime_error("temporal coherence is not enabled");
+                n.update_tc(make_afterstate(n.tables(), lo, hi, remaining, cooldown), target, alpha);
+            },
+            nb::arg("board_lo"), nb::arg("board_hi"), nb::arg("remaining"), nb::arg("cooldown"), nb::arg("target"),
+            nb::arg("alpha"), "TD step scaled per weight by |E| / A (1 before its first step)");
 
     nb::class_<bpa::Trainer>(m, "Trainer", "lock-free multithreaded TD(0) self-play with restarts near game overs")
-        .def(nb::init<bpa::NTuple&, float, float, double, int, uint64_t>(), nb::arg("ntuple"), nb::arg("gamma"),
-             nb::arg("alpha"), nb::arg("restart_frac"), nb::arg("threads"), nb::arg("seed"), nb::keep_alive<1, 2>())
+        .def(nb::init<bpa::NTuple&, float, float, double, int, uint64_t, std::vector<int>, bool>(), nb::arg("ntuple"),
+             nb::arg("gamma"), nb::arg("alpha"), nb::arg("restart_frac"), nb::arg("threads"), nb::arg("seed"),
+             nb::arg("search_widths") = std::vector<int>{}, nb::arg("search_play") = false, nb::keep_alive<1, 2>(),
+             "search_widths: search-backed targets (search_learn) on every step; empty: the next state's best Q1")
         .def_rw("alpha", &bpa::Trainer::alpha)
         .def(
             "run",
@@ -270,6 +291,28 @@ NB_MODULE(_engine, m) {
         nb::arg("ntuple"), nb::arg("board_lo"), nb::arg("board_hi"), nb::arg("pending"), nb::arg("score"),
         nb::arg("history"), nb::arg("gamma"), nb::arg("widths"),
         "kept root moves (top widths[0] by Q1) in engine order -> (slot, pos, points, q1, search score)");
+
+    m.def(
+        "search_learn",
+        [](bpa::NTuple& nt, uint64_t prev_lo, uint64_t prev_hi, const std::vector<int>& prev_remaining, bool prev_cooldown,
+           uint64_t lo, uint64_t hi, const std::vector<int>& pending, int64_t score, const std::vector<int>& history,
+           float gamma, const std::vector<int>& widths, float alpha, bool play_search) -> std::optional<std::tuple<int, int>> {
+            const bpa::Afterstate prev = make_afterstate(nt.tables(), prev_lo, prev_hi, prev_remaining, prev_cooldown);
+            const bpa::State s = make_state(nt.tables(), lo, hi, pending, score, history);
+            bpa::check_widths(widths);
+            bpa::Choice c;
+            bool found;
+            {
+                nb::gil_scoped_release release;
+                found = bpa::search_learn(nt, prev, s, gamma, widths, alpha, play_search, c);
+            }
+            if (!found) return std::nullopt;
+            return std::make_tuple(c.slot, c.pos);
+        },
+        nb::arg("ntuple"), nb::arg("prev_lo"), nb::arg("prev_hi"), nb::arg("prev_remaining"), nb::arg("prev_cooldown"),
+        nb::arg("board_lo"), nb::arg("board_hi"), nb::arg("pending"), nb::arg("score"), nb::arg("history"), nb::arg("gamma"),
+        nb::arg("widths"), nb::arg("alpha"), nb::arg("play_search"),
+        "one search-backed TD step at a state reached from the after-state prev -> the move to play (slot, pos), or None");
 
     m.def(
         "search_move",

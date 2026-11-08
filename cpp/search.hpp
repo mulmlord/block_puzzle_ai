@@ -242,6 +242,56 @@ inline std::vector<Scored> search_scores(const NTuple& nt, const State& s, float
     return out;
 }
 
+// ---- search-backed training targets (docs/superpowers/specs/2026-11-07-search-targets-design.md) ------------
+
+// The after-state of the move (slot, pos) of s, as best_move builds it.
+inline Afterstate move_afterstate(const Tables& t, const State& s, int slot, int pos) {
+    Afterstate a;
+    a.board = apply(t, s.board, s.pending[slot], pos).board;
+    a.remaining[0] = s.pending[slot == 0 ? 1 : 0];
+    a.remaining[1] = s.pending[slot == 2 ? 1 : 2];
+    a.cooldown = in_cooldown(t, s.history);
+    return a;
+}
+
+// The move to play among search_scores' kept moves (not empty): with play_search the first maximum of the search
+// score (search_move's move), else the first maximum of Q1 (best_move's move, since the top move by Q1 is kept).
+inline Choice pick_scored(const NTuple& nt, const State& s, const std::vector<Scored>& kept, bool play_search) {
+    size_t pick = 0;
+    for (size_t i = 1; i < kept.size(); i++)
+        if (play_search ? kept[i].score > kept[pick].score : kept[i].q1 > kept[pick].q1) pick = i;
+    const Scored& m = kept[pick];
+    Choice c;
+    c.slot = m.slot, c.pos = m.pos, c.points = m.points;
+    c.after = move_afterstate(nt.tables(), s, m.slot, m.pos);
+    c.v = nt.value(c.after);
+    c.q = play_search ? m.score : m.q1;
+    return c;
+}
+
+// One search-backed TD step at s, reached from the after-state prev. The kept moves' scores E(s, m, widths[1:]) come
+// from the weights before the step; then V(prev) moves towards max E, and each kept move's after-state towards
+// (E - r) / gamma, in engine order. With no legal move, V(prev) moves towards 0 and it returns false; otherwise
+// ``out`` is the move to play (pick_scored, with V(after) from before the step).
+inline bool search_learn(NTuple& nt, const Afterstate& prev, const State& s, float gamma, const std::vector<int>& widths,
+                         float alpha, bool play_search, Choice& out) {
+    const std::vector<Scored> kept = search_scores(nt, s, gamma, widths);
+    if (kept.empty()) {
+        nt.learn(prev, 0.0, alpha);
+        return false;
+    }
+    double best = kept[0].score;
+    for (const Scored& m : kept) {
+        check_finite(m.score);
+        best = std::max(best, m.score);
+    }
+    out = pick_scored(nt, s, kept, play_search);
+    nt.learn(prev, best, alpha);
+    for (const Scored& m : kept)
+        nt.learn(move_afterstate(nt.tables(), s, m.slot, m.pos), (m.score - m.points) / gamma, alpha);
+    return true;
+}
+
 // Lets idle threads join the searches of running games (evaluate_search, once fewer games than threads are
 // left). A driver publishes a loop of n tasks in its slot; it and any idle thread take tasks one at a time. Each
 // task writes its own output, so the results do not depend on which thread ran what.

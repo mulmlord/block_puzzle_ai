@@ -173,6 +173,68 @@ def test_update_precision_at_large_values():
     assert value(model, board, rem, False) - before >= 50.0  # nominal step: 0.1 * 1000 = 100
 
 
+def test_update_tc_first_step_is_a_plain_step(random_model):
+    """Before a weight's first step its rate is 1, so update_tc moves V like update."""
+    _, model = random_model
+    plain = make_model(model.tuples)
+    plain.weights[:] = model.weights
+    model.enable_tc()
+    for board, rem, cd in sample_afterstates(6, 8):
+        fresh = make_model(model.tuples)  # every weight unvisited
+        fresh.weights[:] = model.weights
+        fresh.enable_tc()
+        target = value(fresh, board, rem, cd) + 500.0
+        fresh.update_tc(board & (2**64 - 1), board >> 64, rem, cd, target, 0.1)
+        plain.update(board & (2**64 - 1), board >> 64, rem, cd, target, 0.1)
+        assert value(fresh, board, rem, cd) == pytest.approx(value(plain, board, rem, cd), abs=1e-3)
+        plain.weights[:] = model.weights
+
+
+def test_update_tc_slows_weights_whose_steps_cancel():
+    tuples = [[0, 1, 2, 3, 10, 11, 12, 13]]
+    model = make_model(tuples)
+    model.enable_tc()
+    board, rem = 0b111, [0, 27]
+    lo, hi = board & (2**64 - 1), board >> 64
+    for k in range(50):  # targets alternately above and below V: the steps cancel, so |E| / A falls
+        model.update_tc(lo, hi, rem, False, value(model, board, rem, False) + (100.0 if k % 2 else -100.0), 0.5)
+    e, a = model.tc_state[:, 0], model.tc_state[:, 1]
+    touched = a > 0
+    assert touched.sum() >= 3 and np.all(np.abs(e[touched]) / a[touched] < 0.1)
+    before = value(model, board, rem, False)
+    model.update_tc(lo, hi, rem, False, before + 100.0, 0.5)
+    assert 0 < value(model, board, rem, False) - before < 0.1 * 0.5 * 100.0
+    agreeing = make_model(tuples)
+    agreeing.enable_tc()
+    for _ in range(50):  # targets always above V: the rate stays 1
+        agreeing.update_tc(lo, hi, rem, False, value(agreeing, board, rem, False) + 100.0, 0.5)
+    e, a = agreeing.tc_state[:, 0], agreeing.tc_state[:, 1]
+    assert np.allclose(np.abs(e[a > 0]), a[a > 0])
+
+
+def test_tc_state_needs_enable(random_model):
+    _, model = random_model
+    assert not model.tc_enabled
+    with pytest.raises(RuntimeError):
+        model.tc_state
+    with pytest.raises(RuntimeError):
+        model.update_tc(0, 0, [0, 1], False, 1.0, 0.1)
+    model.enable_tc()
+    assert model.tc_enabled and model.tc_state.shape == (model.n_weights, 2) and not model.tc_state.any()
+
+
+def test_trainer_uses_tc_once_enabled():
+    tuples = shapes_to_tuples(["line"])
+    a, b = make_model(tuples), make_model(tuples)
+    b.enable_tc()
+    _engine.Trainer(a, 1.0, 0.1, 0.5, 1, 7).run(5000)
+    _engine.Trainer(b, 1.0, 0.1, 0.5, 1, 7).run(5000)
+    assert not np.array_equal(a.weights, b.weights)
+    assert np.isfinite(b.weights).all() and (b.tc_state[:, 1] > 0).sum() > 100
+    rates = np.abs(b.tc_state[:, 0]) / np.maximum(b.tc_state[:, 1], 1e-300)
+    assert rates[b.tc_state[:, 1] > 0].min() < 0.5
+
+
 def test_evaluate_deterministic_across_threads(random_model):
     _, model = random_model
     model.weights[:] *= 0.01
@@ -225,10 +287,27 @@ def test_checkpoint_roundtrip(tmp_path, random_model):
     cfg = NTupleConfig(alpha=0.05)
     save_checkpoint(tmp_path / "m.ntw", cfg, tuples, model.weights, 1234, 5.5)
     loaded, cfg2, meta = load_model(tmp_path / "m.ntw")
-    assert cfg2 == cfg and meta == {"moves_trained": 1234, "elapsed_min": 5.5}
+    assert cfg2 == cfg and meta == {"moves_trained": 1234, "elapsed_min": 5.5, "tc": None}
+    assert not loaded.tc_enabled
     assert np.array_equal(loaded.weights, model.weights)
     for board, rem, cd in sample_afterstates(10, 5):
         assert value(loaded, board, rem, cd) == value(model, board, rem, cd)
+
+
+def test_checkpoint_roundtrip_with_tc(tmp_path, random_model):
+    tuples, model = random_model
+    model.enable_tc()
+    model.tc_state[:] = np.random.default_rng(1).random((model.n_weights, 2))
+    save_checkpoint(tmp_path / "m.ntw", NTupleConfig(tc=True), tuples, model.weights, 7, 1.0, model.tc_state)
+    loaded, cfg, meta = load_model(tmp_path / "m.ntw")
+    assert cfg.tc and loaded.tc_enabled
+    assert np.array_equal(loaded.tc_state, model.tc_state) and np.array_equal(loaded.weights, model.weights)
+    raw = (tmp_path / "m.ntw").read_bytes()
+    (tmp_path / "short.ntw").write_bytes(raw[:-8])
+    with pytest.raises(ValueError):
+        load_checkpoint(tmp_path / "short.ntw")
+    with pytest.raises(ValueError):
+        save_checkpoint(tmp_path / "x.ntw", NTupleConfig(), tuples, model.weights, 0, 0.0, model.tc_state[1:])
 
 
 def test_checkpoint_rejects_corruption(tmp_path, random_model):
@@ -265,6 +344,39 @@ def test_train_resume_and_evaluate_cli(tmp_path, capsys):
     assert out["games"] == 4 and len(out["results"]) == 4
 
 
+def test_train_tc_and_init_cli(tmp_path):
+    main(train_args(tmp_path / "a", 100_000) + ["--tc"])
+    cfg, _, _, meta = load_checkpoint(tmp_path / "a" / "latest.ntw")
+    assert cfg.tc and cfg.init is None and meta["tc"] is not None and (meta["tc"][:, 1] > 0).any()
+    main(train_args(tmp_path / "a", 150_000) + ["--resume"])  # keeps its tc state and goes on with it
+    resumed = load_checkpoint(tmp_path / "a" / "latest.ntw")[3]["tc"]
+    assert resumed[:, 1].sum() > meta["tc"][:, 1].sum()
+    init = str(tmp_path / "a" / "latest.ntw")
+    main(train_args(tmp_path / "b", 50_000) + ["--init", init])
+    cfg_b, _, _, meta_b = load_checkpoint(tmp_path / "b" / "latest.ntw")
+    assert cfg_b.init == init and cfg_b.tc and meta_b["moves_trained"] >= 50_000
+    assert cfg_b.alpha == pytest.approx(0.1)  # the default cap for 2 threads, not the source run's
+    model, _, _ = load_model(init)  # the same weights without tc state: --init then starts plain TD
+    save_checkpoint(tmp_path / "plain.ntw", NTupleConfig(shapes=["line"]), [list(t) for t in model.tuples], model.weights, 0, 0.0)
+    main(train_args(tmp_path / "c", 20_000) + ["--init", str(tmp_path / "plain.ntw")])
+    cfg_c, _, _, meta_c = load_checkpoint(tmp_path / "c" / "latest.ntw")
+    assert not cfg_c.tc and meta_c["tc"] is None
+    with pytest.raises(SystemExit):
+        main(train_args(tmp_path / "d", 20_000) + ["--init", init, "--shapes", "window4"])
+
+
+def test_train_search_targets_cli(tmp_path):
+    main(train_args(tmp_path / "a", 3000) + ["--target-k", "2", "--play-search"])
+    cfg, _, _, meta = load_checkpoint(tmp_path / "a" / "latest.ntw")
+    assert cfg.target_k == 2 and cfg.play_search and meta["moves_trained"] >= 3000
+    main(train_args(tmp_path / "a", 6000) + ["--resume"])  # keeps both
+    cfg = load_checkpoint(tmp_path / "a" / "latest.ntw")[0]
+    assert cfg.target_k == 2 and cfg.play_search
+    for bad in (["--play-search"], ["--target-k", "-1"]):
+        with pytest.raises(SystemExit):
+            main(train_args(tmp_path / "b", 3000) + bad)
+
+
 def test_resume_keeps_best(tmp_path):
     main(train_args(tmp_path, 100_000))
     lines = (tmp_path / "metrics.jsonl").read_text().splitlines()
@@ -279,7 +391,9 @@ def test_resume_keeps_best(tmp_path):
 def test_interrupt_saves_latest(tmp_path):
     proc = subprocess.Popen([sys.executable, "-m", "block_puzzle_ai.ntuple", "train", "--out", str(tmp_path), "--hours",
                              "1", "--threads", "1", "--shapes", "line", "--eval-minutes", "60", "--chunk-seconds", "1"])  # fmt: skip
-    time.sleep(8)
+    metrics, deadline = tmp_path / "metrics.jsonl", time.monotonic() + 120  # startup imports torch: slow on a busy machine
+    while not (metrics.exists() and '"train"' in metrics.read_text()) and time.monotonic() < deadline:
+        time.sleep(0.5)
     proc.send_signal(signal.SIGINT)
     assert proc.wait(timeout=30) == 0
     assert load_checkpoint(tmp_path / "latest.ntw")[3]["moves_trained"] > 0

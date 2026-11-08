@@ -453,3 +453,98 @@ def test_evaluate_cli_without_search_unchanged(checkpoint, capsys):
     expected = _engine.evaluate_ntuple(model, 4, 1, 100, 2, 0.999)
     assert [(r["score"], r["moves"]) for r in out["results"]] == [(r[0], r[1]) for r in expected]
     assert "search" not in out
+
+
+# ---- search-backed training targets (docs/superpowers/specs/2026-11-07-search-targets-design.md) -----------
+
+
+def update(model, board, rem, cd, target, alpha):
+    model.update(board & LOW64, board >> 64, rem, cd, target, alpha)
+
+
+def learn(model, prev, state, widths, alpha, play_search):
+    board, pending, score, history = state
+    prev_board, prev_rem, prev_cd = prev
+    return _engine.search_learn(model, prev_board & LOW64, prev_board >> 64, prev_rem, prev_cd, board & LOW64, board >> 64,
+                                pending, score, history, G, widths, alpha, play_search)  # fmt: skip
+
+
+def ref_learn(model, prev, state, widths, alpha, play_search):
+    """The spec's step on CppGame, search_scores and update: scores from the weights before the step, then V(prev)
+    towards max E and each kept after-state towards (E - r) / gamma, in engine order."""
+    after = {(slot, pos): (board, rem) for slot, pos, _, board, rem, _ in ref_q1(model, G, *state)}
+    kept = scores(model, state, widths)
+    if not kept:
+        update(model, *prev, 0.0, alpha)
+        return None
+    update(model, *prev, max(e for *_, e in kept), alpha)
+    for slot, pos, points, _, e in kept:
+        update(model, *after[slot, pos], cooldown(state[3]), (e - points) / G, alpha)
+    key = (lambda m: m[4]) if play_search else (lambda m: m[3])
+    best = max(kept, key=key)  # max returns the first maximum: engine order breaks ties
+    return best[0], best[1]
+
+
+@pytest.mark.parametrize("widths", [[2], [3, 2]])
+@pytest.mark.parametrize("play_search", [False, True])
+def test_search_learn_matches_reference(widths, play_search):
+    _, model = random_model()
+    _, ref = random_model()
+    states = mid_game_states()
+    for i, state in enumerate(states):
+        prev_state = states[i - 1]
+        _, _, _, prev_board, prev_rem, _ = ref_q1(ref, G, *prev_state)[0]
+        prev = (prev_board, prev_rem, cooldown(prev_state[3]))
+        expected = ref_learn(ref, prev, state, widths, 0.05, play_search)
+        assert learn(model, prev, state, widths, 0.05, play_search) == expected
+        assert np.array_equal(model.weights, ref.weights)
+    assert not np.array_equal(model.weights, random_model()[1].weights)
+
+
+def test_search_learn_dead_state_moves_prev_to_zero():
+    _, model = random_model()
+    _, ref = random_model()
+    board = sum(1 << (r * 10 + c) for r in range(10) for c in range(10) if (r + c) % 2 == 0)  # isolated holes only
+    pending = [i for i, p in enumerate(all_pieces()) if len(p.cells) > 1][:3]
+    state = (board, pending, 1000, [-1, -1, -1])
+    assert scores(model, state, [2]) == []
+    prev = (0b111, [pending[0], pending[1]], False)
+    assert learn(model, prev, state, [2], 0.05, True) is None
+    update(ref, *prev, 0.0, 0.05)
+    assert np.array_equal(model.weights, ref.weights)
+
+
+@pytest.mark.parametrize("play_search", [False, True])
+def test_search_trainer_at_alpha_zero_plays_the_evaluated_game(play_search):
+    """A one-thread trainer at alpha 0 plays its first game as the evaluators do: with search play like
+    evaluate_ntuple_search with tier (+inf, [2]), with 1-ply play like evaluate_ntuple."""
+    _, model = random_model()
+    before = model.weights.copy()
+    for seed in (3, 5, 11):
+        if play_search:
+            _, score, moves, *_ = run_search(model, 1, seed, 10**6, 1, [(INF, [2])])[0]
+        else:
+            score, moves, *_ = _engine.evaluate_ntuple(model, 1, seed, 10**6, 1, G)[0]
+        st = _engine.Trainer(model, G, 0.0, 0.0, 1, seed, [2], play_search).run(moves)
+        assert (st["games"], st["mean_score"], st["mean_moves"]) == (1, score, moves)
+    assert np.array_equal(model.weights, before)
+
+
+def test_search_trainer_chunks_equal_one_run_and_learns():
+    _, a = random_model()
+    _, b = random_model()
+    ta = _engine.Trainer(a, G, 0.01, 0.5, 1, 7, [2], False)
+    tb = _engine.Trainer(b, G, 0.01, 0.5, 1, 7, [2], False)
+    ta.run(300)
+    ta.run(300)
+    tb.run(600)
+    assert np.array_equal(a.weights, b.weights)
+    assert not np.array_equal(a.weights, random_model()[1].weights)
+
+
+def test_trainer_rejects_bad_search_options():
+    _, model = random_model()
+    with pytest.raises(ValueError):
+        _engine.Trainer(model, G, 0.01, 0.5, 1, 7, [-1], False)
+    with pytest.raises(ValueError):
+        _engine.Trainer(model, G, 0.01, 0.5, 1, 7, [], True)
